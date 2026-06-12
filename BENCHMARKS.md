@@ -31,16 +31,23 @@ extra package); mem0 skips LLM extraction via its documented `infer=False`.
 - **Retrieval quality ties by construction.** With the same embedder, both
   systems rank by the same cosine signal; the embedder does that work. The
   memory layer's job is everything else — and that's where the columns differ.
+- **mem0's own documentation corroborates the stale-fact result**: their add
+  docs state that raw (`infer=False`) inserts "skip conflict resolution" and
+  that "duplicates will land" (docs.mem0.ai, memory-operations/add). We
+  measured what that means in practice.
 - **The stale-fact result is the point.** When a fact is updated in similar
   wording, time-blind cosine confidently returns the OLD fact every single
   time; remembrane's recency-aware ranking returns the current one 20/20, and
   its conflict detection flags the contradiction either way. When the update is
-  *rephrased*, the lexical embedder fails both systems equally (0/20) — plug a
-  neural embedder into both and similarity ties more often, which recency then
-  breaks; we have not measured that configuration and don't claim it.
+  *rephrased*, the lexical embedder fails both systems equally (0/20) at the
+  ranking layer — though remembrane's conflict detection still surfaces the
+  contradiction (`possible` tier), so the agent is told not to trust top-1.
+  Run the neural configuration yourself:
+  `pip install model2vec && python benchmarks/levelfield.py --embedder model2vec`
+  (same static embedding model injected into both systems).
 - **What this does NOT measure:** mem0's LLM extraction layer (its main value
-  proposition — also its cost: 1-3 LLM calls and 200-500 ms per write, per
-  their docs), cloud features, team sharing. On full-pipeline accuracy
+  proposition — also its cost: LLM calls on every write per mem0's docs;
+  independent write-ups measure 200-500 ms added write latency), cloud features, team sharing. On full-pipeline accuracy
   benchmarks (LoCoMo, LongMemEval) mem0 and Zep publish strong numbers; this
   benchmark deliberately measures the layer *underneath* all that.
 - One sentence: **below the LLM layer, the premium memory systems are vector

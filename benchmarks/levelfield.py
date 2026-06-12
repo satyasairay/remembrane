@@ -24,7 +24,10 @@ Fairness notes:
   - mem0 add() uses infer=False; that is the documented way to use mem0-OSS
     without an LLM, and it is exactly the "come down to our level" condition.
 
-Run: pip install remembrane mem0ai && python benchmarks/levelfield.py
+Run:
+  pip install remembrane mem0ai && python benchmarks/levelfield.py
+  # neural configuration (same static embedding model for both systems):
+  pip install model2vec && python benchmarks/levelfield.py --embedder model2vec
 """
 from __future__ import annotations
 
@@ -57,6 +60,26 @@ FILLER = ("the sprint review moved to thursday afternoon",
           "the retro surfaced three action items")
 
 
+def make_embedder(kind: str):
+    """Return an object with embed(list[str]) -> list[vec] and .dimension."""
+    if kind == "hash":
+        from remembrane.embedders import HashEmbedder
+        return HashEmbedder()
+    if kind == "model2vec":
+        from model2vec import StaticModel
+
+        class M2V:
+            def __init__(self):
+                self._m = StaticModel.from_pretrained("minishlab/potion-base-8M")
+                self.dimension = int(self._m.encode(["x"]).shape[1])
+
+            def embed(self, texts):
+                return [[float(x) for x in v] for v in self._m.encode(list(texts))]
+
+        return M2V()
+    raise SystemExit(f"unknown embedder {kind!r}")
+
+
 def build_world(rng):
     entities = []
     for i in range(N_ENTITIES):
@@ -79,11 +102,11 @@ def build_world(rng):
     return entities, distractors
 
 
-def bench_remembrane(entities, distractors, tmp):
+def bench_remembrane(entities, distractors, tmp, embedder):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from remembrane import MemoryStore
     db = Path(tmp) / "lf-remembrane.db"
-    m = MemoryStore(db)
+    m = MemoryStore(db, embedder=embedder)
     writes = []
     month_ago = time.time() - 30 * 86400
     v1_ids = []
@@ -125,20 +148,19 @@ def bench_remembrane(entities, distractors, tmp):
             "conflict_flagged": conflicts, "bytes": size}
 
 
-def bench_mem0(entities, distractors, tmp):
+def bench_mem0(entities, distractors, tmp, embedder):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from mem0 import Memory
-    from remembrane.embedders import HashEmbedder
+    dims = embedder.dimension
     cfg = {"vector_store": {"provider": "qdrant",
                             "config": {"path": str(Path(tmp) / "lf-qdrant"),
-                                       "embedding_model_dims": 512, "on_disk": True}},
-           "embedder": {"provider": "openai", "config": {"embedding_dims": 512}}}
+                                       "embedding_model_dims": dims, "on_disk": True}},
+           "embedder": {"provider": "openai", "config": {"embedding_dims": dims}}}
     m = Memory.from_config(cfg)
-    he = HashEmbedder()
 
     class _SameEmbedder:  # equal terms: identical embedder for both systems
         def embed(self, text, memory_action=None):
-            return he.embed([text])[0]
+            return embedder.embed([text])[0]
 
     m.embedding_model = _SameEmbedder()
     writes = []
@@ -171,13 +193,19 @@ def bench_mem0(entities, distractors, tmp):
 
 
 def main():
+    import argparse
     import tempfile
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--embedder", choices=["hash", "model2vec"], default="hash")
+    args = ap.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     rng = random.Random(SEED)
     entities, distractors = build_world(rng)
     tmp = tempfile.mkdtemp(prefix="levelfield-")
-    print(f"level-field benchmark | {N_ENTITIES*2 + N_DISTRACTORS} memories | seed {SEED}")
-    r = bench_remembrane(entities, distractors, tmp)
-    z = bench_mem0(entities, distractors, tmp)
+    print(f"level-field benchmark | {N_ENTITIES*2 + N_DISTRACTORS} memories | "
+          f"seed {SEED} | embedder: {args.embedder}")
+    r = bench_remembrane(entities, distractors, tmp, make_embedder(args.embedder))
+    z = bench_mem0(entities, distractors, tmp, make_embedder(args.embedder))
     agree = sum(a == b for a, b in zip(r["top1"], z["top1"]))
     print(f"\n{'metric':<28}{'remembrane':>14}{'mem0 (infer=False)':>20}")
     print("-" * 62)
