@@ -66,12 +66,55 @@ class Memory:
 
 @dataclass
 class RecallResult:
-    """A memory returned by recall, with its ranking signals."""
+    """A memory returned by recall, with every ranking signal exposed."""
 
     memory: Memory
-    similarity: float
-    recency: float
-    score: float
+    similarity: float       # combined text relevance used for ranking
+    recency: float          # exp-decay factor in [0, 1]
+    score: float            # final composite score
+    vector_score: float = 0.0   # exact cosine similarity component
+    keyword_score: float = 0.0  # exact BM25 component (normalized)
+
+    def explain(self) -> Dict[str, Any]:
+        """Full breakdown of why this memory was recalled. Glass box, not black box."""
+        return {
+            "content": self.memory.content,
+            "score": round(self.score, 4),
+            "components": {
+                "vector_similarity": round(self.vector_score, 4),
+                "keyword_bm25": round(self.keyword_score, 4),
+                "combined_similarity": round(self.similarity, 4),
+                "recency": round(self.recency, 4),
+                "importance": self.memory.importance,
+            },
+            "memory_id": self.memory.id,
+            "namespace": self.memory.namespace,
+            "access_count": self.memory.access_count,
+        }
+
+    def explain_text(self) -> str:
+        """Human-readable one-paragraph explanation."""
+        return (
+            f"score {self.score:.3f} = similarity {self.similarity:.3f} "
+            f"(vector {self.vector_score:.3f}, keyword {self.keyword_score:.3f}) "
+            f"+ recency {self.recency:.3f} + importance {self.memory.importance:.2f} "
+            f"| recalled {self.memory.access_count}x"
+        )
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"RecallResult(score={self.score:.3f}, content={self.memory.content[:60]!r})"
+
+
+@dataclass
+class JournalEntry:
+    """One event in the memory journal (append-only history)."""
+
+    seq: int
+    ts: float
+    op: str                  # store | forget | reinforce | merge | consolidate
+    memory_id: str
+    namespace: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"JournalEntry(#{self.seq} {self.op} {self.memory_id[:8]})"

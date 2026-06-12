@@ -4,8 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 
 from .store import MemoryStore
+
+
+def _fmt_ts(ts) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
 
 
 def main(argv=None) -> int:
@@ -22,6 +27,8 @@ def main(argv=None) -> int:
     p_recall.add_argument("query")
     p_recall.add_argument("--namespace", default="default")
     p_recall.add_argument("-k", type=int, default=5)
+    p_recall.add_argument("--mode", choices=["hybrid", "vector", "keyword"], default="hybrid")
+    p_recall.add_argument("--explain", action="store_true", help="Show ranking breakdown per result")
 
     p_list = sub.add_parser("list", help="List all memories")
     p_list.add_argument("--namespace", default=None)
@@ -34,6 +41,21 @@ def main(argv=None) -> int:
 
     sub.add_parser("stats", help="Show database stats")
 
+    p_snap = sub.add_parser("snapshot", help="Record a named point in time")
+    p_snap.add_argument("label")
+
+    p_log = sub.add_parser("log", help="Show memory history (newest first)")
+    p_log.add_argument("--namespace", default=None)
+    p_log.add_argument("--limit", type=int, default=30)
+
+    p_diff = sub.add_parser("diff", help="What changed between two snapshots (or snapshot..now)")
+    p_diff.add_argument("a", help="snapshot label")
+    p_diff.add_argument("b", nargs="?", default=None, help="snapshot label (default: now)")
+
+    p_merge = sub.add_parser("merge", help="Merge another memory db into this one")
+    p_merge.add_argument("source", help="path to the other .db file")
+    p_merge.add_argument("--dedupe-threshold", type=float, default=0.95)
+
     args = parser.parse_args(argv)
     store = MemoryStore(args.db)
 
@@ -41,8 +63,11 @@ def main(argv=None) -> int:
         mem = store.store(args.content, namespace=args.namespace, importance=args.importance)
         print(f"stored {mem.id}")
     elif args.cmd == "recall":
-        for r in store.recall(args.query, k=args.k, namespace=args.namespace, touch=False):
+        for r in store.recall(args.query, k=args.k, namespace=args.namespace,
+                              touch=False, mode=args.mode):
             print(f"{r.score:.3f}  [{r.memory.id[:8]}]  {r.memory.content}")
+            if args.explain:
+                print(f"        {r.explain_text()}")
     elif args.cmd == "list":
         for m in store.all(args.namespace):
             print(f"[{m.id[:8]}] ({m.namespace}, imp={m.importance:.2f}) {m.content}")
@@ -56,6 +81,26 @@ def main(argv=None) -> int:
         print(f"memories: {store.count()}")
         for ns in store.namespaces():
             print(f"  {ns}: {store.count(ns)}")
+    elif args.cmd == "snapshot":
+        ts = store.snapshot(args.label)
+        print(f"snapshot {args.label!r} at {_fmt_ts(ts)}")
+    elif args.cmd == "log":
+        for e in store.log(namespace=args.namespace, limit=args.limit):
+            detail = e.payload.get("content", "") or e.payload.get("reason", "")
+            print(f"{_fmt_ts(e.ts)}  {e.op:<11} [{e.memory_id[:8]}] {detail[:70]}")
+    elif args.cmd == "diff":
+        d = store.diff(args.a, args.b)
+        for item in d["added"]:
+            print(f"+ {item['content']}")
+        for item in d["removed"]:
+            print(f"- {item['content']}")
+        for item in d["changed"]:
+            print(f"~ {item['content']} (importance {item['importance_before']:.2f} -> {item['importance_after']:.2f})")
+        if not any(d.values()):
+            print("no changes")
+    elif args.cmd == "merge":
+        result = store.merge_from(args.source, dedupe_threshold=args.dedupe_threshold)
+        print(f"added {result['added']}, merged {result['merged']} duplicates")
     store.close()
     return 0
 

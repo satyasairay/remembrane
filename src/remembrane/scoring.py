@@ -23,6 +23,7 @@ class ScoringConfig:
     weight_recency: float = 0.15
     weight_importance: float = 0.15
     half_life_seconds: float = 7 * 24 * 3600.0  # one week
+    keyword_weight: float = 0.35  # BM25 share of combined similarity in hybrid mode
 
     def __post_init__(self) -> None:
         total = self.weight_similarity + self.weight_recency + self.weight_importance
@@ -34,6 +35,8 @@ class ScoringConfig:
         self.weight_importance /= total
         if self.half_life_seconds <= 0:
             raise ValueError("half_life_seconds must be positive")
+        if not 0.0 <= self.keyword_weight <= 1.0:
+            raise ValueError("keyword_weight must be between 0.0 and 1.0")
 
 
 def recency_factor(memory: Memory, now: float | None = None, half_life: float = 7 * 24 * 3600.0) -> float:

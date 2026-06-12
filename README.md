@@ -1,6 +1,6 @@
 # remembrane
 
-**Local-first persistent memory for AI agents.** SQLite-backed, zero required dependencies, pluggable embeddings, with adapters for LangChain and CrewAI and a built-in MCP server.
+**Local-first persistent memory for AI agents.** One SQLite file, zero required dependencies. Exact hybrid recall (vector + BM25 — never approximate), explainable ranking, time-travel over memory history, and deterministic behavior you can unit-test in CI. Adapters for LangChain and CrewAI, plus a built-in MCP server.
 
 ```bash
 pip install remembrane
@@ -12,7 +12,10 @@ Agents forget everything between sessions. Existing memory solutions are cloud A
 
 - **One file.** Your agent's entire memory is a SQLite database you can copy, back up, diff, or delete.
 - **Zero required dependencies.** The default embedder is pure stdlib. `pip install remembrane` pulls in nothing else.
-- **Human-like recall.** Results are ranked by a composite of semantic similarity, recency decay (memories halve in weight every week by default), and importance. Recalled memories are *reinforced* — spaced repetition for agents.
+- **Human-like recall.** Results are ranked by a composite of similarity, recency decay (memories halve in weight every week by default), and importance. Recalled memories are *reinforced* — spaced repetition for agents.
+- **Exact, not approximate.** Large systems use approximate nearest-neighbor search and accept missed results. At agent-memory scale, remembrane scores *every* memory — hybrid vector + BM25 keyword in one pass, guaranteed complete.
+- **A memory you can debug.** Every store/forget/reinforce is journaled. Snapshot, diff, and reconstruct what your agent knew at any point in time. Every recall result explains exactly why it ranked where it did.
+- **Testable in CI.** Deterministic embedder + frozen-time recall = reproducible memory behavior. `remembrane.testing` ships pytest-friendly assertions.
 - **Framework-agnostic.** Use it bare, through the LangChain or CrewAI adapters, or expose it to any MCP-capable agent (like Claude) as an MCP server.
 
 ## Quick start
@@ -130,6 +133,65 @@ remembrane --db agent.db stats
 remembrane --db agent.db export > backup.json
 ```
 
+
+## Time travel
+
+Every mutation is journaled, so the past is queryable:
+
+```python
+mem.snapshot("before-research")
+# ... agent runs, learns things, forgets things ...
+
+mem.diff("before-research")
+# {'added': [{'content': 'competitor launched a new pricing tier', ...}],
+#  'removed': [...], 'changed': [...]}
+
+mem.as_of("before-research")          # full memory state at that point
+mem.log()                             # newest-first history of every operation
+```
+
+Or from the CLI: `remembrane snapshot v1`, `remembrane diff v1`, `remembrane log`.
+"What did my agent believe last Tuesday, and what changed its mind?" is now an answerable question.
+
+## Explainable recall
+
+No black boxes — every result carries its full ranking breakdown:
+
+```python
+r = mem.recall("what theme does the user like?")[0]
+r.explain()
+# {'score': 0.6087, 'components': {'vector_similarity': 0.71, 'keyword_bm25': 1.0,
+#   'combined_similarity': 0.81, 'recency': 0.98, 'importance': 0.8}, ...}
+r.explain_text()
+# 'score 0.609 = similarity 0.812 (vector 0.713, keyword 1.000) + recency 0.984 + importance 0.80 | recalled 3x'
+```
+
+## Testing your agent's memory
+
+Deterministic recall means memory behavior is unit-testable — something no cloud memory API can offer:
+
+```python
+from remembrane.testing import assert_recalls, assert_recalls_first, assert_not_recalls
+
+def test_agent_remembers_allergies():
+    mem = build_agent_memory()
+    assert_recalls_first(mem, "any food allergies?", "peanuts")
+    assert_not_recalls(mem, "any food allergies?", "dark mode", k=1)
+```
+
+Pass `now=...` to `recall()` to freeze time and make recency scoring reproducible.
+
+## Merging memories
+
+Memory files are portable — merge two agents' brains, with near-duplicate absorption:
+
+```python
+mem.merge_from("other-agent.db")            # {'added': 12, 'merged': 3}
+mem.merge_from("backup.db", namespaces=["prefs"], dedupe_threshold=0.95)
+```
+
+CLI: `remembrane --db a.db merge b.db`
+
 ## How ranking works
 
 ```
@@ -137,7 +199,7 @@ score = 0.7·similarity + 0.15·recency + 0.15·importance
 recency = exp(−ln2 · age / half_life)
 ```
 
-`age` is measured from the memory's **last access**, not creation — every recall resets the decay clock. Frequently-used memories stay vivid; untouched ones fade. All weights and the half-life are configurable.
+`age` is measured from the memory's **last access**, not creation — every recall resets the decay clock. Frequently-used memories stay vivid; untouched ones fade. In the default hybrid mode, similarity is `0.65·cosine + 0.35·bm25`. All weights, the mode, and the half-life are configurable.
 
 ## Design choices
 

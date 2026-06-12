@@ -9,3 +9,4 @@ build/
 *.db
 .venv/
 pytest-cache-files-*/
+launch-posts.md
