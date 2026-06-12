@@ -26,6 +26,28 @@ extra package); mem0 skips LLM extraction via its documented `infer=False`.
 | required deps (pip) | **0** | openai, posthog, protobuf, qdrant-client, sqlalchemy, pydantic, pytz |
 | top-1 retrieval agreement | 20/40 — disagreements are exactly the stale-fact cases | — |
 
+## Semantic configuration (same run, `--embedder model2vec`)
+
+Same benchmark with a real semantic embedding model (model2vec
+potion-base-8M, ~30MB, no torch) injected into BOTH systems. Measured on the
+maintainer's Windows machine, Python 3.12:
+
+| metric | remembrane | mem0 (infer=False) |
+|---|---:|---:|
+| median write latency | **3.0 ms** | 19.8 ms |
+| median recall latency | **1.8 ms** | 3.3 ms |
+| stale-fact, parallel phrasing | **19/20 current** | 10/20 (coin flip) |
+| stale-fact, rephrased update | **20/20 current** | 4/20 (worse than chance) |
+| contradictions surfaced | **10/10** | not a feature |
+| storage for same corpus | **0.52 MB** | 1.44 MB |
+
+With semantics, old and new facts embed nearly alike — so time-blind cosine
+picks between them arbitrarily (parallel) or actively prefers the stale
+phrasing that better matches the query template (rephrased, 4/20). Recency-
+aware ranking resolves the tie correctly 39/40 times. This is the benchmark's
+central finding: **ranking that ignores time cannot do agent memory's core
+job, no matter how good the embedder is.**
+
 ## Reading this honestly
 
 - **Retrieval quality ties by construction.** With the same embedder, both
