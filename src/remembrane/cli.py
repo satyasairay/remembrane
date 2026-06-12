@@ -72,7 +72,11 @@ def main(argv=None) -> int:
     p_merge.add_argument("--dedupe-threshold", type=float, default=0.95)
 
     args = parser.parse_args(argv)
-    store = MemoryStore(args.db)
+    try:
+        store = MemoryStore(args.db)
+    except Exception as exc:  # pragma: no cover - depends on host fs
+        print(f"error: cannot open database {args.db!r}: {exc}", file=sys.stderr)
+        return 1
 
     if args.cmd == "store":
         mem = store.store(args.content, namespace=args.namespace, importance=args.importance)
@@ -137,5 +141,13 @@ def main(argv=None) -> int:
     return 0
 
 
+def _main_wrapper(argv=None) -> int:
+    try:
+        return main(argv)
+    except (ValueError, KeyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_main_wrapper())

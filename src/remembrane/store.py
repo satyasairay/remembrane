@@ -92,6 +92,9 @@ class MemoryStore:
         scoring: Optional[ScoringConfig] = None,
     ):
         self.path = str(path)
+        if self.path != ":memory:":
+            parent = Path(self.path).expanduser().resolve().parent
+            parent.mkdir(parents=True, exist_ok=True)
         self.embedder = embedder or HashEmbedder()
         self.scoring = scoring or ScoringConfig()
         self._lock = threading.RLock()
@@ -176,11 +179,12 @@ class MemoryStore:
         k: int = 5,
         namespace: Optional[str] = "default",
         min_score: float = 0.0,
+        min_similarity: float = 0.0,
         touch: bool = True,
         mode: str = "hybrid",
         now: Optional[float] = None,
     ) -> List[RecallResult]:
-        """Return the top-k memories, ranked by similarity x recency x importance.
+        """Return the top-k memories, ranked by similarity, recency, importance, and earned usefulness.
 
         Search is *exact*, not approximate: every memory in scope is scored.
 
@@ -189,12 +193,17 @@ class MemoryStore:
             k: Max results.
             namespace: Restrict to one namespace; pass None to search all.
             min_score: Drop results scoring below this.
+            min_similarity: Results must exceed this text relevance to qualify
+                at all (default 0.0 — zero-relevance memories are never
+                returned, regardless of recency or importance).
             touch: If True (default), bump access stats on returned memories,
                 which strengthens them against decay (spaced-repetition style).
             mode: "hybrid" (vector + BM25 keyword, default), "vector", or "keyword".
             now: Override the current timestamp — makes recall fully
                 deterministic for tests and replay.
         """
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
         if mode not in ("hybrid", "vector", "keyword"):
             raise ValueError("mode must be 'hybrid', 'vector', or 'keyword'")
         now = now if now is not None else time.time()
@@ -233,6 +242,8 @@ class MemoryStore:
                 sim = vs
             else:
                 sim = ks
+            if sim <= min_similarity:
+                continue  # recency/importance rank relevant memories; they never substitute for relevance
             score, rec = composite_score(sim, mem, self.scoring, now=now)
             if score >= min_score:
                 results.append(

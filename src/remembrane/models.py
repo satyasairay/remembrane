@@ -40,6 +40,8 @@ class Memory:
             raise ValueError("Memory content must be a non-empty string")
         if not 0.0 <= self.importance <= 1.0:
             raise ValueError("importance must be between 0.0 and 1.0")
+        if self.metadata is not None and not isinstance(self.metadata, dict):
+            raise ValueError("metadata must be a dict (or None)")
 
     def to_row(self) -> tuple:
         return (

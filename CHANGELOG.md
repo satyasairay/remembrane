@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.1 — 2026-06-12
+
+Fixes from an independent package audit. No new features.
+
+### Fixed
+- Zero-relevance memories are no longer returned: similarity must be positive
+  to qualify; recency/importance rank relevant memories but never substitute
+  for relevance. New `min_similarity` recall parameter.
+- `recall(None)` now raises a clear `ValueError` instead of an AttributeError.
+- `MemoryStore("missing/dir/db.sqlite")` creates parent directories instead of
+  failing with a raw sqlite error.
+- CLI prints one-line errors instead of Python tracebacks.
+- `metadata` must now be a dict; previously lists/strings were accepted and
+  failed later.
+- README scoring documentation matched to the implemented formula and current
+  default weights (it previously described multiplicative scoring and v0.2
+  weights).
+
 ## 0.3.0 — 2026-06-12
 
 ### Added

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "remembrane"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local-first persistent memory for AI agents. SQLite-backed, zero required dependencies, pluggable embeddings, framework adapters and an MCP server."
 readme = "README.md"
 license = "MIT"
@@ -38,7 +38,7 @@ mcp = ["mcp>=1.0"]
 dev = ["pytest>=7.0", "pytest-cov", "ruff"]
 
 [project.scripts]
-remembrane = "remembrane.cli:main"
+remembrane = "remembrane.cli:_main_wrapper"
 remembrane-mcp = "remembrane.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]

@@ -12,7 +12,7 @@ Agents forget everything between sessions. Existing memory solutions are cloud A
 
 - **One file.** Your agent's entire memory is a SQLite database you can copy, back up, diff, or delete.
 - **Zero required dependencies.** The default embedder is pure stdlib. `pip install remembrane` pulls in nothing else.
-- **Human-like recall.** Results are ranked by a composite of similarity, recency decay (memories halve in weight every week by default), and importance. Recalled memories are *reinforced* — spaced repetition for agents.
+- **Human-like recall.** Results are ranked by a weighted sum of similarity, recency decay (halves every week by default), importance, and outcome-earned usefulness. Recalled memories are *reinforced* — spaced repetition for agents.
 - **Exact, not approximate.** Large systems use approximate nearest-neighbor search and accept missed results. At agent-memory scale, remembrane scores *every* memory — hybrid vector + BM25 keyword in one pass, guaranteed complete.
 - **A memory you can debug.** Every store/forget/reinforce is journaled. Snapshot, diff, and reconstruct what your agent knew at any point in time. Every recall result explains exactly why it ranked where it did.
 - **Testable in CI.** Deterministic embedder + frozen-time recall = reproducible memory behavior. `remembrane.testing` ships pytest-friendly assertions.
@@ -30,7 +30,7 @@ mem.store("Deploy target is AWS us-east-1", namespace="ops")
 
 results = mem.recall("what theme does the user like?")
 print(results[0].memory.content)         # → "User prefers dark mode"
-print(results[0].score)                  # similarity × recency × importance
+print(results[0].score)                  # weighted: similarity + recency + importance + usefulness
 ```
 
 ### Memory lifecycle
@@ -52,9 +52,10 @@ from remembrane import MemoryStore, ScoringConfig
 mem = MemoryStore(
     "agent.db",
     scoring=ScoringConfig(
-        weight_similarity=0.7,
+        weight_similarity=0.65,
         weight_recency=0.15,
-        weight_importance=0.15,
+        weight_importance=0.10,
+        weight_usefulness=0.10,            # earned from mark_useful()/mark_useless()
         half_life_seconds=7 * 24 * 3600,   # recency halves every week
     ),
 )
@@ -239,9 +240,12 @@ CLI: `remembrane --db a.db merge b.db`
 ## How ranking works
 
 ```
-score = 0.7·similarity + 0.15·recency + 0.15·importance
-recency = exp(−ln2 · age / half_life)
+score      = 0.65·similarity + 0.15·recency + 0.10·importance + 0.10·usefulness
+recency    = exp(−ln2 · age / half_life)
+usefulness = sigmoid(outcome feedback)
 ```
+
+Scoring is a weighted sum (weights normalize to 1), with one hard rule on top: similarity must be positive for a memory to be returned at all — recency and importance rank relevant memories, they never substitute for relevance.
 
 `age` is measured from the memory's **last access**, not creation — every recall resets the decay clock. Frequently-used memories stay vivid; untouched ones fade. In the default hybrid mode, similarity is `0.65·cosine + 0.35·bm25`. All weights, the mode, and the half-life are configurable.
 
