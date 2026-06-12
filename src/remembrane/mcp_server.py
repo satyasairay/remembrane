@@ -62,6 +62,40 @@ def build_server(db_path: str):
         return f"Reinforced {memory_id}" if mem else f"No memory {memory_id}"
 
     @server.tool()
+    def memory_conflicts(query: str = "", namespace: str = "default") -> str:
+        """Check for conflicting memories (optionally scoped to a query) before answering.
+        Returns tensions for you to adjudicate or ask the user about."""
+        found = store.conflicts(query or None, namespace=namespace)
+        if not found:
+            return "No conflicting memories detected."
+        return "\n\n".join(
+            f"[{c.a.id} vs {c.b.id}]\n{c.describe()}" for c in found[:5]
+        )
+
+    @server.tool()
+    def memory_resolve(keep_id: str, drop_id: str, reason: str = "") -> str:
+        """Settle a conflict: keep one memory, forget the other. Journaled and auditable."""
+        n = store.resolve(keep_id, [drop_id], reason=reason)
+        return f"Kept {keep_id}, dropped {n} memory(ies)."
+
+    @server.tool()
+    def memory_feedback(memory_id: str, useful: bool) -> str:
+        """After completing a task, report whether a recalled memory actually helped.
+        Useful memories rank higher in future; useless ones fade."""
+        mem = store.feedback(memory_id, useful)
+        if not mem:
+            return f"No memory {memory_id}"
+        return f"Recorded. {memory_id} usefulness is now {mem.usefulness:+.1f}."
+
+    @server.tool()
+    def memory_pack(query: str, budget_tokens: int = 800, namespace: str = "default") -> str:
+        """Get the optimal set of memories that fits a token budget (exact, deduplicated)."""
+        chosen = store.pack(query, budget_tokens=budget_tokens, namespace=namespace)
+        if not chosen:
+            return "No memories found."
+        return "\n".join(f"[{r.memory.id}|{r.tokens}tok] {r.memory.content}" for r in chosen)
+
+    @server.tool()
     def memory_stats() -> str:
         """Count memories per namespace."""
         lines = [f"total: {store.count()}"]

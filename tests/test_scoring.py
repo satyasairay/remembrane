@@ -26,7 +26,8 @@ def test_recency_uses_last_access():
 
 
 def test_composite_score_weights_normalized():
-    cfg = ScoringConfig(weight_similarity=7, weight_recency=1.5, weight_importance=1.5)
+    cfg = ScoringConfig(weight_similarity=7, weight_recency=1.5, weight_importance=1.5,
+                        weight_usefulness=0)
     now = time.time()
     mem = Memory(content="x", importance=1.0, created_at=now)
     score, rec = composite_score(1.0, mem, cfg, now=now)

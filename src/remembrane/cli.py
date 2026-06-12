@@ -52,6 +52,21 @@ def main(argv=None) -> int:
     p_diff.add_argument("a", help="snapshot label")
     p_diff.add_argument("b", nargs="?", default=None, help="snapshot label (default: now)")
 
+    p_conf = sub.add_parser("conflicts", help="Surface memories in tension")
+    p_conf.add_argument("query", nargs="?", default=None)
+    p_conf.add_argument("--namespace", default="default")
+
+    p_fb = sub.add_parser("feedback", help="Record task-outcome feedback for a memory")
+    p_fb.add_argument("memory_id")
+    g = p_fb.add_mutually_exclusive_group(required=True)
+    g.add_argument("--useful", action="store_true")
+    g.add_argument("--useless", action="store_true")
+
+    p_pack = sub.add_parser("pack", help="Optimal memory set for a token budget")
+    p_pack.add_argument("query")
+    p_pack.add_argument("--budget", type=int, default=800)
+    p_pack.add_argument("--namespace", default="default")
+
     p_merge = sub.add_parser("merge", help="Merge another memory db into this one")
     p_merge.add_argument("source", help="path to the other .db file")
     p_merge.add_argument("--dedupe-threshold", type=float, default=0.95)
@@ -98,6 +113,23 @@ def main(argv=None) -> int:
             print(f"~ {item['content']} (importance {item['importance_before']:.2f} -> {item['importance_after']:.2f})")
         if not any(d.values()):
             print("no changes")
+    elif args.cmd == "conflicts":
+        found = store.conflicts(args.query, namespace=args.namespace)
+        if not found:
+            print("no conflicts detected")
+        for c in found:
+            print(f"--- {c.confidence} (ids {c.a.id[:8]} vs {c.b.id[:8]})")
+            print(c.describe())
+    elif args.cmd == "feedback":
+        mem = store.feedback(args.memory_id, args.useful)
+        print(f"usefulness now {mem.usefulness:+.1f}" if mem else "no such memory")
+    elif args.cmd == "pack":
+        chosen = store.pack(args.query, budget_tokens=args.budget, namespace=args.namespace,
+                            touch=False)
+        total = sum(r.tokens for r in chosen)
+        for r in chosen:
+            print(f"{r.score:.3f}  ({r.tokens:>4} tok)  {r.memory.content}")
+        print(f"-- {len(chosen)} memories, {total}/{args.budget} tokens")
     elif args.cmd == "merge":
         result = store.merge_from(args.source, dedupe_threshold=args.dedupe_threshold)
         print(f"added {result['added']}, merged {result['merged']} duplicates")

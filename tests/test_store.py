@@ -131,6 +131,7 @@ def test_invalid_memory():
 
 def test_scoring_config_validation():
     with pytest.raises(ValueError):
-        ScoringConfig(weight_similarity=0, weight_recency=0, weight_importance=0)
+        ScoringConfig(weight_similarity=0, weight_recency=0, weight_importance=0,
+                      weight_usefulness=0)
     with pytest.raises(ValueError):
         ScoringConfig(half_life_seconds=-1)

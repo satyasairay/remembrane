@@ -1,6 +1,6 @@
 # remembrane
 
-**Local-first persistent memory for AI agents.** One SQLite file, zero required dependencies. Exact hybrid recall (vector + BM25 — never approximate), explainable ranking, time-travel over memory history, and deterministic behavior you can unit-test in CI. Adapters for LangChain and CrewAI, plus a built-in MCP server.
+**Local-first persistent memory for AI agents.** One SQLite file, zero required dependencies. Exact hybrid recall (vector + BM25 — never approximate), explainable ranking, time-travel over memory history, conflict-aware recall that admits uncertainty, salience learned from task outcomes, optimal token-budget packing, and deterministic behavior you can unit-test in CI. Adapters for LangChain and CrewAI, plus a built-in MCP server.
 
 ```bash
 pip install remembrane
@@ -133,6 +133,50 @@ remembrane --db agent.db stats
 remembrane --db agent.db export > backup.json
 ```
 
+
+
+## Conflict-aware recall
+
+Every other memory system silently resolves contradictions and returns one confident answer — which is how agents end up confidently wrong. remembrane surfaces the tension and lets the agent adjudicate (or ask the user):
+
+```python
+mem.store("the user lives in London")
+mem.store("the user moved to Tokyo, no longer in London")
+
+for c in mem.conflicts("where does the user live?"):
+    print(c.describe())
+# Conflicting memories (likely, change_markers=['longer', 'moved', 'no']):
+#   older: 'the user lives in London' (recalled 4x)
+#   newer: 'the user moved to Tokyo, no longer in London' (recalled 0x)
+
+mem.resolve(keep_id=newer.id, drop_ids=[older.id], reason="user confirmed Tokyo")
+```
+
+Detection is deterministic and free (anchor-word overlap + change markers + numeric mismatches — honest heuristics, not hidden LLM judgments). Resolutions are journaled, so every settled conflict stays auditable via `log()` and `as_of()`. Also exposed as the `memory_conflicts` / `memory_resolve` MCP tools and `remembrane conflicts` CLI.
+
+## Salience earned from outcomes
+
+Cloud systems decide what matters *at write time*, with an LLM call you pay for on every memory. remembrane inverts it: writes are free, and importance is **earned by helping**:
+
+```python
+results = mem.recall("how do I deploy this?")
+# ... agent completes its task using results[0] ...
+mem.mark_useful(results[0].memory.id)     # this memory rises
+mem.mark_useless(results[2].memory.id)    # this one fades
+```
+
+Feedback accumulates into a usefulness signal (sigmoid-squashed into ranking, neutral at zero). Memories that keep helping outrank memories that merely match — learned per-deployment, from real outcomes, with zero LLM calls.
+
+## Token-budget packing
+
+Agents don't want "top 5 results"; they want the best use of the context window space they have left:
+
+```python
+context = mem.pack("user preferences", budget_tokens=800)
+sum(r.tokens for r in context)   # <= 800, guaranteed
+```
+
+`pack()` scores every candidate exactly, suppresses near-duplicates so the budget is never spent saying the same thing twice, then solves the selection *exactly* (0/1 knapsack) — the returned set maximizes total relevance within the budget. Deterministic, no LLM, microseconds. Pass `token_estimator=your_tokenizer` for exact counts.
 
 ## Time travel
 

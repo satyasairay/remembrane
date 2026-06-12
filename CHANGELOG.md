@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0 — 2026-06-12
+
+### Added
+- **Conflict-aware recall**: `conflicts()` surfaces memories in tension
+  (deterministic heuristics: anchor overlap, change markers, numeric
+  mismatches) instead of silently picking a winner; `resolve()` settles them
+  with a journaled, auditable decision. New MCP tools `memory_conflicts` /
+  `memory_resolve`, CLI `remembrane conflicts`.
+- **Outcome feedback**: `mark_useful()` / `mark_useless()` / `feedback()` —
+  salience is earned from task outcomes (sigmoid-squashed `usefulness` term in
+  ranking) instead of guessed at write time. New MCP tool `memory_feedback`,
+  CLI `remembrane feedback`.
+- **Token-budget packing**: `pack(query, budget_tokens=800)` returns the
+  provably optimal, deduplicated memory set within a token budget (exact 0/1
+  knapsack). New MCP tool `memory_pack`, CLI `remembrane pack`.
+
+### Changed
+- Scoring now has four normalized weights (similarity/recency/importance/
+  usefulness, default 0.65/0.15/0.10/0.10).
+- Existing 0.2.x databases are migrated automatically (adds the `usefulness`
+  column).
+
 ## 0.2.0 — 2026-06-12
 
 ### Added

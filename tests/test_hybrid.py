@@ -57,6 +57,7 @@ def test_explain_structure(store):
     info = r.explain()
     assert set(info["components"]) == {
         "vector_similarity", "keyword_bm25", "combined_similarity", "recency", "importance",
+        "usefulness",
     }
     assert info["memory_id"] == r.memory.id
     assert "score" in r.explain_text()

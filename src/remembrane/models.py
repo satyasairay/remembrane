@@ -21,6 +21,8 @@ class Memory:
         created_at: Unix timestamp of creation.
         last_accessed_at: Unix timestamp of the most recent recall hit.
         access_count: Number of times this memory was returned by recall().
+        usefulness: Signed outcome-feedback accumulator. Positive: this memory
+            helped the agent complete tasks; negative: recalled but useless.
     """
 
     content: str
@@ -31,6 +33,7 @@ class Memory:
     created_at: float = field(default_factory=time.time)
     last_accessed_at: Optional[float] = None
     access_count: int = 0
+    usefulness: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.content or not self.content.strip():
@@ -48,6 +51,7 @@ class Memory:
             self.created_at,
             self.last_accessed_at,
             self.access_count,
+            self.usefulness,
         )
 
     @classmethod
@@ -61,6 +65,7 @@ class Memory:
             created_at=row[5],
             last_accessed_at=row[6],
             access_count=row[7],
+            usefulness=row[8] if len(row) > 8 else 0.0,
         )
 
 
@@ -74,6 +79,7 @@ class RecallResult:
     score: float            # final composite score
     vector_score: float = 0.0   # exact cosine similarity component
     keyword_score: float = 0.0  # exact BM25 component (normalized)
+    tokens: int = 0             # estimated token cost (populated by pack())
 
     def explain(self) -> Dict[str, Any]:
         """Full breakdown of why this memory was recalled. Glass box, not black box."""
@@ -86,6 +92,7 @@ class RecallResult:
                 "combined_similarity": round(self.similarity, 4),
                 "recency": round(self.recency, 4),
                 "importance": self.memory.importance,
+                "usefulness": round(self.memory.usefulness, 4),
             },
             "memory_id": self.memory.id,
             "namespace": self.memory.namespace,

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 from .bm25 import normalized_bm25
+from .conflicts import Conflict, detect_conflicts, estimate_tokens, knapsack_pack
 from .embedders import Embedder, HashEmbedder, cosine_similarity
 from .models import JournalEntry, Memory, RecallResult
 from .scoring import ScoringConfig, composite_score
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at REAL NOT NULL,
     last_accessed_at REAL,
     access_count INTEGER NOT NULL DEFAULT 0,
+    usefulness REAL NOT NULL DEFAULT 0,
     embedding BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
@@ -43,7 +45,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
 """
 
 _MEM_COLS = (
-    "id, namespace, content, importance, metadata, created_at, last_accessed_at, access_count"
+    "id, namespace, content, importance, metadata, created_at, last_accessed_at,"
+    " access_count, usefulness"
+)
+
+_INSERT_SQL = (
+    "INSERT OR REPLACE INTO memories"
+    " (id, namespace, content, importance, metadata, created_at, last_accessed_at,"
+    " access_count, usefulness, embedding) VALUES (?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -88,6 +97,9 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "usefulness" not in cols:  # migrate dbs created before 0.3.0
+            self._conn.execute("ALTER TABLE memories ADD COLUMN usefulness REAL NOT NULL DEFAULT 0")
         self._conn.commit()
 
     # ---------------------------------------------------------------- journal
@@ -120,10 +132,7 @@ class MemoryStore:
             mem.id = memory_id
         vec = self.embedder.embed([content])[0]
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO memories VALUES (?,?,?,?,?,?,?,?,?)",
-                (*mem.to_row(), _pack(vec)),
-            )
+            self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
             self._journal(
                 "store",
                 mem.id,
@@ -146,10 +155,7 @@ class MemoryStore:
                     importance=kwargs.get("importance", 0.5),
                     metadata=dict(kwargs.get("metadata") or {}),
                 )
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO memories VALUES (?,?,?,?,?,?,?,?,?)",
-                    (*mem.to_row(), _pack(vec)),
-                )
+                self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
                 self._journal(
                     "store",
                     mem.id,
@@ -205,11 +211,11 @@ class MemoryStore:
         if not rows:
             return []
 
-        mems = [Memory.from_row(r[:8]) for r in rows]
+        mems = [Memory.from_row(r[:9]) for r in rows]
 
         if mode in ("hybrid", "vector"):
             qvec = self.embedder.embed([query])[0]
-            vec_scores = [cosine_similarity(qvec, _unpack(r[8])) for r in rows]
+            vec_scores = [cosine_similarity(qvec, _unpack(r[9])) for r in rows]
         else:
             vec_scores = [0.0] * len(rows)
 
@@ -334,7 +340,7 @@ class MemoryStore:
                 f"SELECT {_MEM_COLS}, embedding FROM memories WHERE namespace=? ORDER BY created_at",
                 (namespace,),
             ).fetchall()
-        mems = [(Memory.from_row(r[:8]), _unpack(r[8])) for r in rows]
+        mems = [(Memory.from_row(r[:9]), _unpack(r[9])) for r in rows]
         removed_ids = set()
         merges = []
         for i in range(len(mems)):
@@ -362,6 +368,170 @@ class MemoryStore:
                 self._journal("forget", absorbed.id, namespace, {"reason": "consolidated"})
             self._conn.commit()
         return len(removed_ids)
+
+
+    # --------------------------------------------------------------- feedback
+
+    def feedback(self, memory_id: str, useful: bool, weight: float = 1.0) -> Optional[Memory]:
+        """Record a task outcome for a recalled memory.
+
+        Positive feedback raises the memory's earned usefulness (sigmoid-squashed
+        into ranking); negative lowers it. This is how salience is *learned from
+        outcomes* instead of guessed at write time.
+        """
+        if weight <= 0:
+            raise ValueError("weight must be positive")
+        delta = weight if useful else -weight
+        with self._lock:
+            self._conn.execute(
+                "UPDATE memories SET usefulness = usefulness + ? WHERE id=?",
+                (delta, memory_id),
+            )
+            mem = self.get(memory_id)
+            if mem:
+                self._journal("feedback", memory_id, mem.namespace,
+                              {"useful": useful, "weight": weight,
+                               "usefulness": mem.usefulness})
+            self._conn.commit()
+        return mem
+
+    def mark_useful(self, memory_id: str, weight: float = 1.0) -> Optional[Memory]:
+        """This memory helped the agent complete its task."""
+        return self.feedback(memory_id, True, weight)
+
+    def mark_useless(self, memory_id: str, weight: float = 1.0) -> Optional[Memory]:
+        """This memory was recalled but contributed nothing."""
+        return self.feedback(memory_id, False, weight)
+
+    # -------------------------------------------------------------- conflicts
+
+    def conflicts(
+        self,
+        query: Optional[str] = None,
+        *,
+        namespace: Optional[str] = "default",
+        k: int = 50,
+        similarity_floor: float = 0.35,
+        similarity_ceiling: float = 0.92,
+    ) -> List[Conflict]:
+        """Surface memories in tension, instead of silently picking a winner.
+
+        With a query, only memories relevant to it are examined (the agent's
+        "wait — do I hold conflicting beliefs about this?" check before
+        answering). Without one, the whole namespace is swept.
+
+        Detection is deterministic and free; adjudication is the agent's job —
+        resolve() the loser, or ask the user.
+        """
+        if query is not None:
+            results = self.recall(query, k=k, namespace=namespace, touch=False)
+            mems = [r.memory for r in results]
+        else:
+            mems = self.all(namespace)
+        if len(mems) < 2:
+            return []
+        vecs = self._embeddings_for([m.id for m in mems])
+        return detect_conflicts(
+            mems, vecs,
+            similarity_floor=similarity_floor,
+            similarity_ceiling=similarity_ceiling,
+        )
+
+    def resolve(self, keep_id: str, drop_ids: Sequence[str], reason: str = "") -> int:
+        """Settle a conflict: keep one memory, forget the others. Fully journaled.
+
+        The dropped memories remain reconstructable via as_of()/log() — resolution
+        is an auditable decision, not an erasure of history.
+        """
+        kept = self.get(keep_id)
+        if kept is None:
+            raise KeyError(f"no memory {keep_id!r}")
+        dropped = 0
+        with self._lock:
+            for did in drop_ids:
+                mem = self.get(did)
+                if mem is None:
+                    continue
+                self._conn.execute("DELETE FROM memories WHERE id=?", (did,))
+                self._journal("resolve", keep_id, kept.namespace,
+                              {"dropped": did, "dropped_content": mem.content,
+                               "reason": reason})
+                self._journal("forget", did, mem.namespace, {"reason": f"resolved: {reason}"})
+                dropped += 1
+            self._conn.commit()
+        return dropped
+
+    def _embeddings_for(self, ids: Sequence[str]) -> List[List[float]]:
+        with self._lock:
+            rows = {
+                r[0]: r[1]
+                for r in self._conn.execute(
+                    f"SELECT id, embedding FROM memories WHERE id IN ({','.join('?' * len(ids))})",
+                    list(ids),
+                ).fetchall()
+            }
+        return [_unpack(rows[i]) for i in ids]
+
+    # ---------------------------------------------------------------- packing
+
+    def pack(
+        self,
+        query: str,
+        *,
+        budget_tokens: int = 800,
+        namespace: Optional[str] = "default",
+        mode: str = "hybrid",
+        candidates: int = 256,
+        dedupe_threshold: float = 0.92,
+        now: Optional[float] = None,
+        touch: bool = True,
+        token_estimator=None,
+    ) -> List[RecallResult]:
+        """The best possible use of a token budget, not an arbitrary top-k.
+
+        Scores candidates exactly (like recall), drops near-duplicates so the
+        budget isn't spent saying the same thing twice, then solves the packing
+        problem exactly: the returned set maximizes total relevance within
+        ``budget_tokens``. Deterministic, no LLM, microseconds.
+
+        Args:
+            token_estimator: callable(text) -> int. Defaults to a ~4 chars/token
+                heuristic; pass your tokenizer's count for exact budgets.
+        """
+        est = token_estimator or estimate_tokens
+        results = self.recall(
+            query, k=candidates, namespace=namespace, mode=mode, touch=False, now=now
+        )
+        if not results:
+            return []
+        # near-duplicate suppression, keeping the higher-scored of each pair
+        vecs = self._embeddings_for([r.memory.id for r in results])
+        kept: List[int] = []
+        for i in range(len(results)):
+            if all(
+                cosine_similarity(vecs[i], vecs[j]) < dedupe_threshold for j in kept
+            ):
+                kept.append(i)
+        candidates_kept = [results[i] for i in kept]
+        tokens = [est(r.memory.content) for r in candidates_kept]
+        selected_idx, _total = knapsack_pack(
+            [r.score for r in candidates_kept], tokens, budget_tokens
+        )
+        chosen = []
+        for i in selected_idx:
+            r = candidates_kept[i]
+            r.tokens = tokens[i]
+            chosen.append(r)
+        chosen.sort(key=lambda r: r.score, reverse=True)
+        if touch and chosen:
+            bump_now = now if now is not None else time.time()
+            with self._lock:
+                self._conn.executemany(
+                    "UPDATE memories SET last_accessed_at=?, access_count=access_count+1 WHERE id=?",
+                    [(bump_now, r.memory.id) for r in chosen],
+                )
+                self._conn.commit()
+        return chosen
 
     # ------------------------------------------------------------ time travel
 
@@ -540,10 +710,7 @@ class MemoryStore:
                                        "metadata": merged_meta})
                         merged += 1
                     else:
-                        self._conn.execute(
-                            "INSERT OR REPLACE INTO memories VALUES (?,?,?,?,?,?,?,?,?)",
-                            (*mem.to_row(), _pack(vec)),
-                        )
+                        self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
                         self._journal("merge", mem.id, mem.namespace,
                                       {"content": mem.content,
                                        "importance": mem.importance,
@@ -570,6 +737,7 @@ class MemoryStore:
                 "created_at": m.created_at,
                 "last_accessed_at": m.last_accessed_at,
                 "access_count": m.access_count,
+                "usefulness": m.usefulness,
             }
             for m in self.all(namespace)
         ]
