@@ -7,6 +7,7 @@ import sqlite3
 import struct
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -208,6 +209,15 @@ class MemoryStore:
             with self._lock:
                 self._conn.executemany("UPDATE memories SET embedding=? WHERE id=?", healed)
                 self._conn.commit()
+            healed_ids = [h[1] for h in healed]
+            shown = ", ".join(healed_ids[:5]) + ("..." if len(healed_ids) > 5 else "")
+            warnings.warn(
+                f"remembrane: {len(healed_ids)} memory embedding blob(s) were missing or "
+                f"corrupt and have been re-embedded from content (ids: {shown}). "
+                "If this recurs, check for external writers or storage corruption.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
         rows = fixed_rows
         ids = [r[0] for r in rows]
         tokens = [tokenize(r[1]) for r in rows]

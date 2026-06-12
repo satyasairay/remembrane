@@ -129,6 +129,34 @@ def detect_conflicts(
             numeric_mismatch = has_numbers or value_mismatch
             # identical content apart from the numbers ("deadline is day 12/26")
             remainder_equal = (words[i] - numbers[i]) == (words[j] - numbers[j])
+            # value substitution: same statement template, one slot swapped
+            # ("written in python" -> "written in rust", "us-east-1" -> "eu-west-1").
+            # Requires equal-arity diffs AND an identical token template once
+            # the swapped words are removed -- a slot swap substitutes a value,
+            # it does not rephrase the sentence. General by construction: no
+            # whitelist of technologies, regions, or other value classes.
+            diff_i, diff_j = words[i] - words[j], words[j] - words[i]
+            substitution = False
+            # Guards: template equality (same sentence minus the swapped words),
+            # contiguity (the swapped words form ONE slot, e.g. "us east", not
+            # scattered differences like "1 ... export" vs "2 ... import"), and
+            # a leading-word check (a leading diff usually names a different
+            # subject -- "alice ..."/"bob ..." are two coexisting facts).
+            if 1 <= len(diff_i) <= 2 and len(diff_i) == len(diff_j):
+                toks_i = _WORD_RE.findall(memories[i].content.lower())
+                toks_j = _WORD_RE.findall(memories[j].content.lower())
+                template_i = [t for t in toks_i if t not in diff_i]
+                template_j = [t for t in toks_j if t not in diff_j]
+                def _contiguous(toks, diff):
+                    pos = [k for k, t in enumerate(toks) if t in diff]
+                    return bool(pos) and pos[-1] - pos[0] == len(pos) - 1
+                leading = (toks_i and toks_i[0] in diff_i) or (toks_j and toks_j[0] in diff_j)
+                substitution = (
+                    template_i == template_j
+                    and _contiguous(toks_i, diff_i)
+                    and _contiguous(toks_j, diff_j)
+                    and not leading
+                )
             if strong:
                 confidence = "likely"
                 signals.append(f"change_markers={sorted(strong)}")
@@ -137,6 +165,9 @@ def detect_conflicts(
                     signals.append(f"numeric_mismatch={sorted(numbers[i])}vs{sorted(numbers[j])}")
                 if remainder_equal or weak:
                     confidence = "likely"
+            if substitution:
+                confidence = "likely"
+                signals.append(f"substitution={sorted(diff_i)}vs{sorted(diff_j)}")
             if weak:
                 signals.append(f"weak_markers={sorted(weak)}")
             # weak-overlap pairs only qualify when a strong signal is present

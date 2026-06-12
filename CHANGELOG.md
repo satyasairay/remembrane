@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.1 — 2026-06-12
+
+Response to round 4 of independent auditing — the final verification audit,
+whose verdict was: yes, 0.5.0 can hold production agent memory, including
+multi-process writers on local disk. Findings were Medium and below; all
+addressed same-day.
+
+### Fixed
+- **Conflict detection value-substitution false negatives (audit: Medium).**
+  A new substitution signal upgrades same-template value swaps ("written in
+  Python" -> "written in Rust", "us-east-1" -> "eu-west-1") to the `likely`
+  tier. General by construction: equal-arity word diffs + identical token
+  template, no whitelist of value classes. A leading-diff-word guard keeps
+  subject swaps ("alice drinks coffee" / "bob drinks coffee") from upgrading.
+  The audit's "old laptop 16GB / new laptop 32GB" benign false positive is
+  retained and documented — suppressing it would also suppress real old->new
+  contradictions.
+- **Corrupt embedding self-heal is now loud (audit: Low).** Re-embedding a
+  missing/corrupt blob emits a RuntimeWarning naming the affected ids.
+  Availability behavior is unchanged.
+
+### Documentation
+- README conflict wording tightened per audit: cites v0.4 (0.875 P / 0.70 R)
+  and v0.5.0 (0.889 P / 0.80 R) measured numbers, names the remaining miss
+  classes, and no longer reads as "all v0.4 false negatives are fixed".
+- WAL sidecar limitation now notes reported sizes are settled-state, not peak
+  (audit: Low).
+- Python 3.9 and 3.13, unverifiable on the audit host, are exercised by CI on
+  Linux/Windows/macOS (all 15 jobs green at the audited commit).
+
+### Tests
+- tests/test_round4_fixes.py: auditor-named pairs as regressions, including
+  the documented false positive asserted *as* a limitation — if behavior
+  changes silently, the suite fails. 130 tests total.
+
 ## 0.5.0 — 2026-06-12
 
 Response to round 3 of independent auditing ("mother of all audits").
