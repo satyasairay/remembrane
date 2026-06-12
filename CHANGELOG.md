@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.0 — 2026-06-12
+
+Driven by round 2 of independent auditing (adversarial claim verification).
+
+### Fixed
+- **pack() budget violation (audit: High).** Knapsack weights now round up and
+  a final exact check enforces the cap: the token budget is a hard guarantee.
+- **LangChain adapter (audit: High).** New `RemembraneChatMessageHistory`
+  returns a real `BaseChatMessageHistory` for `RunnableWithMessageHistory`,
+  verified against langchain-core 1.4. Legacy `RemembraneChatMemory` retained.
+- **CrewAI adapter (audit: High).** Implements the current storage surface
+  (delete/update/list_records, kwargs-tolerant search/save).
+- **diff() directionality (audit: Medium).** `diff(b, a)` now inverts
+  `diff(a, b)` instead of repeating it.
+- **Corrupt journal payloads (audit: Medium).** Malformed JSON no longer
+  crashes `log()`/`as_of()`; corrupt entries are surfaced as `_corrupt`.
+- **Conflict precision (audit: Medium).** Markers split into strong negations
+  vs weak change-verbs needing numeric corroboration; new `min_confidence`
+  filter. Precision on the adversarial set: 0.56 -> 1.00 at unchanged recall.
+
+### Added
+- **Performance overhaul (audit: High).** Corpus caching, lazy row
+  materialization, cached BM25 statistics, and an automatic numpy fast path
+  (`pip install remembrane[fast]`). Versus the audit's measurements: recall at
+  10k memories 738ms -> ~30ms; pack at 1k 1.9s -> ~17ms. README publishes
+  measured tables instead of adjectives.
+- `remembrane store --file PATH|-` for content beyond OS argv limits.
+- `remembrane conflicts --min-confidence likely`.
+
+### Changed
+- README claims rewritten to measured, falsifiable statements (pack guarantee
+  semantics, performance tables, adapter version notes, CLI scope notes).
+
 ## 0.3.1 — 2026-06-12
 
 Fixes from an independent package audit. No new features.

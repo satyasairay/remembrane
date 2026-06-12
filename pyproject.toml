@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "remembrane"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local-first persistent memory for AI agents. SQLite-backed, zero required dependencies, pluggable embeddings, framework adapters and an MCP server."
 readme = "README.md"
 license = "MIT"
@@ -32,10 +32,12 @@ Homepage = "https://github.com/satyasairay/remembrane"
 Issues = "https://github.com/satyasairay/remembrane/issues"
 
 [project.optional-dependencies]
+fast = ["numpy>=1.24"]
 openai = ["openai>=1.0"]
 sentence-transformers = ["sentence-transformers>=2.2"]
 mcp = ["mcp>=1.0"]
-dev = ["pytest>=7.0", "pytest-cov", "ruff"]
+langchain = ["langchain-core>=0.3"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "numpy", "langchain-core"]
 
 [project.scripts]
 remembrane = "remembrane.cli:_main_wrapper"

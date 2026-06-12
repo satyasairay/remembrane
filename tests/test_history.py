@@ -63,12 +63,17 @@ def test_diff_between_two_snapshots(store):
     assert [x["content"] for x in d["added"]] == ["middle fact"]
 
 
-def test_diff_order_insensitive(store):
+def test_diff_is_directional(store):
     store.snapshot("a")
     time.sleep(0.01)
     store.store("x")
     store.snapshot("b")
-    assert store.diff("a", "b") == store.diff("b", "a")
+    forward = store.diff("a", "b")
+    backward = store.diff("b", "a")
+    assert [m["content"] for m in forward["added"]] == ["x"]
+    assert forward["removed"] == []
+    assert [m["content"] for m in backward["removed"]] == ["x"]
+    assert backward["added"] == []
 
 
 def test_unknown_snapshot_raises(store):

@@ -1,11 +1,11 @@
 """remembrane — local-first persistent memory for AI agents."""
-from .embedders import HashEmbedder, OpenAIEmbedder, SentenceTransformerEmbedder, cosine_similarity
 from .conflicts import Conflict
+from .embedders import HashEmbedder, OpenAIEmbedder, SentenceTransformerEmbedder, cosine_similarity
 from .models import JournalEntry, Memory, RecallResult
 from .scoring import ScoringConfig
 from .store import MemoryStore
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 __all__ = [
     "MemoryStore",
     "Memory",

@@ -19,7 +19,9 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_store = sub.add_parser("store", help="Store a memory")
-    p_store.add_argument("content")
+    p_store.add_argument("content", nargs="?", default=None)
+    p_store.add_argument("--file", dest="from_file", default=None,
+                         help="Read content from a file ('-' for stdin) — avoids OS argv length limits")
     p_store.add_argument("--namespace", default="default")
     p_store.add_argument("--importance", type=float, default=0.5)
 
@@ -55,6 +57,7 @@ def main(argv=None) -> int:
     p_conf = sub.add_parser("conflicts", help="Surface memories in tension")
     p_conf.add_argument("query", nargs="?", default=None)
     p_conf.add_argument("--namespace", default="default")
+    p_conf.add_argument("--min-confidence", choices=["possible", "likely"], default="possible")
 
     p_fb = sub.add_parser("feedback", help="Record task-outcome feedback for a memory")
     p_fb.add_argument("memory_id")
@@ -79,7 +82,12 @@ def main(argv=None) -> int:
         return 1
 
     if args.cmd == "store":
-        mem = store.store(args.content, namespace=args.namespace, importance=args.importance)
+        content = args.content
+        if args.from_file:
+            content = sys.stdin.read() if args.from_file == "-" else open(args.from_file, encoding="utf-8").read()
+        if content is None:
+            raise ValueError("provide CONTENT or --file")
+        mem = store.store(content, namespace=args.namespace, importance=args.importance)
         print(f"stored {mem.id}")
     elif args.cmd == "recall":
         for r in store.recall(args.query, k=args.k, namespace=args.namespace,
@@ -118,7 +126,8 @@ def main(argv=None) -> int:
         if not any(d.values()):
             print("no changes")
     elif args.cmd == "conflicts":
-        found = store.conflicts(args.query, namespace=args.namespace)
+        found = store.conflicts(args.query, namespace=args.namespace,
+                                min_confidence=args.min_confidence)
         if not found:
             print("no conflicts detected")
         for c in found:

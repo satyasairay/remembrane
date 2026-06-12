@@ -78,18 +78,21 @@ Note: don't mix embedders in one database. Vectors from different embedders aren
 
 ## LangChain
 
+For current LangChain (verified against langchain-core 1.4):
+
 ```python
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from remembrane import MemoryStore
-from remembrane.adapters import RemembraneChatMemory
+from remembrane.adapters import RemembraneChatMessageHistory
 
-memory = RemembraneChatMemory(MemoryStore("agent.db"), session_id="user-42")
-
-memory.save_context({"input": "my favorite color is teal"}, {"output": "Noted!"})
-memory.load_memory_variables({"input": "what color do I like?"})
-# {'history': 'human: my favorite color is teal\nai: Noted!'}
+store = MemoryStore("agent.db")
+chain = RunnableWithMessageHistory(
+    runnable,
+    lambda session_id: RemembraneChatMessageHistory(store, session_id),
+)
 ```
 
-Unlike buffer memory, this retrieves the exchanges *relevant to the current input* — the context window stays small no matter how long the history grows.
+Needs `pip install langchain-core` (lazily imported — the rest of remembrane stays dependency-free). For legacy pre-1.x code, `RemembraneChatMemory` still provides the old `save_context` / `load_memory_variables` interface with semantic retrieval — no langchain install required at all.
 
 ## CrewAI
 
@@ -99,8 +102,10 @@ from remembrane.adapters import RemembraneStorage
 
 storage = RemembraneStorage(MemoryStore("crew.db"))
 storage.save("the deadline is next friday", metadata={"task": "planning"})
-storage.search("when is the deadline?")
+storage.search("when is the deadline?")          # also: delete / update / list_records / reset
 ```
+
+Duck-typed against CrewAI's storage protocol (save/search/delete/update/list_records/reset, tolerant of version-specific kwargs like `scope_prefix`). CrewAI's interface moves fast — if a release adds methods we lack, open an issue.
 
 ## MCP server
 
@@ -153,7 +158,7 @@ for c in mem.conflicts("where does the user live?"):
 mem.resolve(keep_id=newer.id, drop_ids=[older.id], reason="user confirmed Tokyo")
 ```
 
-Detection is deterministic and free (anchor-word overlap + change markers + numeric mismatches — honest heuristics, not hidden LLM judgments). Resolutions are journaled, so every settled conflict stays auditable via `log()` and `as_of()`. Also exposed as the `memory_conflicts` / `memory_resolve` MCP tools and `remembrane conflicts` CLI.
+Detection is deterministic and free (anchor-word overlap, negation markers, numeric mismatches — honest heuristics, not hidden LLM judgments). Two confidence tiers: `likely` (strong negation or corroborated numeric change) and `possible` (topical tension worth a look). On our 8-case adversarial set the `likely` tier scores perfect precision and recall — but it is 8 hand-built cases, so treat conflicts as *candidates for the agent to adjudicate*, which is the design intent. Filter with `conflicts(min_confidence='likely')`. Resolutions are journaled, so every settled conflict stays auditable via `log()` and `as_of()`. Also exposed as the `memory_conflicts` / `memory_resolve` MCP tools and `remembrane conflicts` CLI.
 
 ## Salience earned from outcomes
 
@@ -177,7 +182,7 @@ context = mem.pack("user preferences", budget_tokens=800)
 sum(r.tokens for r in context)   # <= 800, guaranteed
 ```
 
-`pack()` scores every candidate exactly, suppresses near-duplicates so the budget is never spent saying the same thing twice, then solves the selection *exactly* (0/1 knapsack) — the returned set maximizes total relevance within the budget. Deterministic, no LLM, microseconds. Pass `token_estimator=your_tokenizer` for exact counts.
+`pack()` scores every candidate exactly, suppresses near-duplicates so the budget is never spent saying the same thing twice, then solves the selection with a 0/1 knapsack. The budget is a hard guarantee — token weights round *up* at ~0.1%-of-budget granularity and a final exact check enforces the cap, so the result can be marginally conservative but never over. Deterministic, no LLM. Pass `token_estimator=your_tokenizer` for exact counts.
 
 ## Time travel
 
@@ -237,6 +242,19 @@ mem.merge_from("backup.db", namespaces=["prefs"], dedupe_threshold=0.95)
 
 CLI: `remembrane --db a.db merge b.db`
 
+
+## Performance
+
+Measured on this repo's benchmark (512-dim default embedder, hybrid recall, warm cache; Linux sandbox, Python 3.10). Exact numbers vary by machine — run your own before relying on them:
+
+| memories | recall (numpy) | pack (numpy) | recall (pure python) |
+|---|---|---|---|
+| 1,000 | ~2 ms | ~17 ms | ~50 ms |
+| 10,000 | ~30 ms | ~44 ms | ~475 ms |
+| 50,000 | ~205 ms | ~222 ms | not recommended |
+
+The core stays dependency-free; if numpy is importable it is used automatically (`pip install remembrane[fast]`). Past ~50k memories in one namespace you've outgrown the design — that's vector-database territory, and remembrane won't pretend otherwise.
+
 ## How ranking works
 
 ```
@@ -254,6 +272,12 @@ Scoring is a weighted sum (weights normalize to 1), with one hard rule on top: s
 - **SQLite over a vector DB** — agent memory stores are small (thousands, not billions, of rows). Brute-force cosine over a few thousand vectors is sub-millisecond, and you gain transactions, a single portable file, and zero infra.
 - **No background daemon** — decay is computed at read time, so nothing runs when your agent doesn't.
 - **Duck-typed adapters** — `remembrane` never imports langchain or crewai; the adapters match their interfaces structurally, so there are no version-pinning fights.
+
+## Scope notes
+
+- The CLI writes wherever `--db` points, with the invoking user's permissions — it is a local tool, not a sandbox. Wrap it if you expose it to untrusted input.
+- OS argv limits apply to `remembrane store "<content>"`; use `--file path` or `--file -` (stdin) for large content.
+- MCP argument validation follows pydantic's lax coercion (e.g. `useful="yes"` coerces to `True`).
 
 ## Development
 

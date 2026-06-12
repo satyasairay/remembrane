@@ -23,12 +23,18 @@ from .models import Memory
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 
-# Words that often mark a change of state — a strong hint that one memory
-# updates or contradicts another.
-CHANGE_MARKERS = frozenset(
-    "not no never now new moved changed changing instead longer anymore was were "
-    "used formerly previously old stopped quit switched cancelled canceled".split()
+# Negation words: on their own, near a shared anchor, these strongly suggest
+# one memory contradicts another ("no longer in London").
+STRONG_MARKERS = frozenset(
+    "not no never longer anymore stopped quit cancelled canceled "
+    "formerly previously instead".split()
 )
+# Change verbs: too common in benign sentences ("the new hire moved the
+# meeting") to count alone — they only upgrade confidence when a numeric
+# mismatch corroborates them.
+WEAK_MARKERS = frozenset("now new moved changed changing was were used old switched".split())
+
+CHANGE_MARKERS = STRONG_MARKERS | WEAK_MARKERS  # kept for backwards compatibility
 
 _STOPWORDS = frozenset(
     "the a an is are was were be been to of in on at for and or it its this that "
@@ -96,16 +102,27 @@ def detect_conflicts(
                 continue
             signals = [f"anchor_overlap={overlap:.2f}"]
             confidence = "possible"
-            all_words = _WORD_RE.findall(memories[i].content.lower()) + _WORD_RE.findall(
-                memories[j].content.lower()
-            )
-            markers = CHANGE_MARKERS.intersection(all_words)
-            if markers:
+            anchors = words[i] & words[j]
+            strong, weak = set(), set()
+            for content in (memories[i].content, memories[j].content):
+                toks = _WORD_RE.findall(content.lower())
+                for idx, tok in enumerate(toks):
+                    if tok in CHANGE_MARKERS:
+                        window = toks[max(0, idx - 3): idx + 4]
+                        if anchors.intersection(window):
+                            (strong if tok in STRONG_MARKERS else weak).add(tok)
+            numeric_mismatch = bool(numbers[i] and numbers[j] and numbers[i] != numbers[j])
+            # identical content apart from the numbers ("deadline is day 12/26")
+            remainder_equal = (words[i] - numbers[i]) == (words[j] - numbers[j])
+            if strong:
                 confidence = "likely"
-                signals.append(f"change_markers={sorted(markers)}")
-            if numbers[i] and numbers[j] and numbers[i] != numbers[j]:
-                confidence = "likely"
+                signals.append(f"change_markers={sorted(strong)}")
+            if numeric_mismatch:
                 signals.append(f"numeric_mismatch={sorted(numbers[i])}vs{sorted(numbers[j])}")
+                if remainder_equal or weak:
+                    confidence = "likely"
+            if weak:
+                signals.append(f"weak_markers={sorted(weak)}")
             # weak-overlap pairs only qualify when a strong signal is present
             if confidence == "possible" and overlap < 2 * min_anchor_overlap:
                 continue
@@ -130,15 +147,17 @@ def knapsack_pack(
 ) -> Tuple[List[int], int]:
     """Exact 0/1 knapsack: pick indices maximizing total score within token budget.
 
-    Token granularity is coarsened so the DP stays fast (~1024 buckets); at
-    that resolution the solution is exact. Returns (selected_indices, total_tokens).
+    Token weights are coarsened to ~1024 buckets so the DP stays fast. Weights
+    are rounded UP, so the budget is never exceeded; the selection is optimal at
+    that granularity (~0.1% of the budget). A final exact check enforces the
+    budget unconditionally. Returns (selected_indices, total_tokens).
     """
     n = len(scores)
     if n == 0 or budget <= 0:
         return [], 0
     gran = max(1, budget // 1024)
     b = budget // gran
-    w = [max(1, t // gran) for t in tokens]
+    w = [max(1, -(-t // gran)) for t in tokens]  # ceil division: never under-counts
     # dp[cap] = (best_score, chosen_bitmask_as_set) — store parents for reconstruction
     dp = [0.0] + [0.0] * b
     choice = [[False] * (b + 1) for _ in range(n)]
@@ -159,4 +178,10 @@ def knapsack_pack(
             selected.append(i)
             cap -= w[i]
     selected.reverse()
-    return selected, sum(tokens[i] for i in selected)
+    # hard guarantee: enforce the exact budget even if rounding ever drifts
+    total = sum(tokens[i] for i in selected)
+    while selected and total > budget:
+        worst = min(selected, key=lambda i: scores[i])
+        selected.remove(worst)
+        total -= tokens[worst]
+    return selected, total

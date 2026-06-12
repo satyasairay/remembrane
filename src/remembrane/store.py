@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import struct
 import threading
@@ -9,11 +10,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from .bm25 import normalized_bm25
+from .bm25 import normalized_bm25_tokens, term_frequencies, tokenize
 from .conflicts import Conflict, detect_conflicts, estimate_tokens, knapsack_pack
 from .embedders import Embedder, HashEmbedder, cosine_similarity
 from .models import JournalEntry, Memory, RecallResult
-from .scoring import ScoringConfig, composite_score
+from .scoring import ScoringConfig, usefulness_factor
+
+try:  # optional acceleration — pip install remembrane[fast]
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -60,6 +66,17 @@ def _pack(vec: Sequence[float]) -> bytes:
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
+def _safe_payload(raw) -> Dict[str, Any]:
+    """Journal payloads must never crash history reconstruction."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {"_corrupt": str(data)[:200]}
+    except (json.JSONDecodeError, TypeError):
+        return {"_corrupt": str(raw)[:200]}
+
+
 def _unpack(blob: bytes) -> List[float]:
     n = len(blob) // 4
     return list(struct.unpack(f"<{n}f", blob))
@@ -98,12 +115,64 @@ class MemoryStore:
         self.embedder = embedder or HashEmbedder()
         self.scoring = scoring or ScoringConfig()
         self._lock = threading.RLock()
+        self._corpus: Dict[Any, Dict[str, Any]] = {}
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
         if "usefulness" not in cols:  # migrate dbs created before 0.3.0
             self._conn.execute("ALTER TABLE memories ADD COLUMN usefulness REAL NOT NULL DEFAULT 0")
         self._conn.commit()
+
+    # ----------------------------------------------------------- corpus cache
+
+    def _invalidate(self) -> None:
+        self._corpus.clear()
+
+    def _get_corpus(self, namespace: Optional[str]) -> Dict[str, Any]:
+        """Cached embeddings + tokenizations per namespace (numpy matrix when available).
+
+        Invalidated on every mutation; recall reads stay O(1) SQL + vector math.
+        """
+        key = namespace
+        cached = self._corpus.get(key)
+        if cached is not None:
+            return cached
+        with self._lock:
+            if namespace is None:
+                rows = self._conn.execute("SELECT id, content, embedding FROM memories").fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT id, content, embedding FROM memories WHERE namespace=?", (namespace,)
+                ).fetchall()
+        ids = [r[0] for r in rows]
+        tokens = [tokenize(r[1]) for r in rows]
+        corpus: Dict[str, Any] = {"ids": ids, "idx": {mid: i for i, mid in enumerate(ids)},
+                                  "tokens": tokens,
+                                  "tfs": [term_frequencies(t) for t in tokens],
+                                  "doc_lens": [len(t) for t in tokens],
+                                  "matrix": None, "norms": None, "vecs": None}
+        if rows:
+            if _np is not None:
+                matrix = _np.vstack([_np.frombuffer(r[2], dtype=_np.float32) for r in rows])
+                norms = _np.linalg.norm(matrix, axis=1)
+                norms[norms == 0] = 1.0
+                corpus["matrix"] = matrix
+                corpus["norms"] = norms
+            else:
+                corpus["vecs"] = [_unpack(r[2]) for r in rows]
+        self._corpus[key] = corpus
+        return corpus
+
+    def _similarities(self, qvec: List[float], corpus: Dict[str, Any]) -> List[float]:
+        """Exact cosine similarity of the query against every cached vector."""
+        if not corpus["ids"]:
+            return []
+        if _np is not None and corpus["matrix"] is not None:
+            q = _np.asarray(qvec, dtype=_np.float32)
+            qn = float(_np.linalg.norm(q)) or 1.0
+            sims = (corpus["matrix"] @ q) / (corpus["norms"] * qn)
+            return sims.tolist()
+        return [cosine_similarity(qvec, v) for v in corpus["vecs"]]
 
     # ---------------------------------------------------------------- journal
 
@@ -136,6 +205,7 @@ class MemoryStore:
         vec = self.embedder.embed([content])[0]
         with self._lock:
             self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
+            self._invalidate()
             self._journal(
                 "store",
                 mem.id,
@@ -159,6 +229,7 @@ class MemoryStore:
                     metadata=dict(kwargs.get("metadata") or {}),
                 )
                 self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
+                self._invalidate()
                 self._journal(
                     "store",
                     mem.id,
@@ -209,33 +280,39 @@ class MemoryStore:
         now = now if now is not None else time.time()
         with self._lock:
             if namespace is None:
-                rows = self._conn.execute(
-                    f"SELECT {_MEM_COLS}, embedding FROM memories"
-                ).fetchall()
+                rows = self._conn.execute(f"SELECT {_MEM_COLS} FROM memories").fetchall()
             else:
                 rows = self._conn.execute(
-                    f"SELECT {_MEM_COLS}, embedding FROM memories WHERE namespace=?",
-                    (namespace,),
+                    f"SELECT {_MEM_COLS} FROM memories WHERE namespace=?", (namespace,)
                 ).fetchall()
         if not rows:
             return []
 
-        mems = [Memory.from_row(r[:9]) for r in rows]
+        corpus = self._get_corpus(namespace)
+        order = [corpus["idx"][r[0]] for r in rows]
 
         if mode in ("hybrid", "vector"):
             qvec = self.embedder.embed([query])[0]
-            vec_scores = [cosine_similarity(qvec, _unpack(r[9])) for r in rows]
+            sims_all = self._similarities(qvec, corpus)
+            vec_scores = [sims_all[i] for i in order]
         else:
             vec_scores = [0.0] * len(rows)
 
         if mode in ("hybrid", "keyword"):
-            kw_scores = normalized_bm25(query, [m.content for m in mems])
+            kw_all = normalized_bm25_tokens(
+                tokenize(query), corpus["tokens"],
+                tfs=corpus["tfs"], doc_lens=corpus["doc_lens"],
+            )
+            kw_scores = [kw_all[i] for i in order]
         else:
             kw_scores = [0.0] * len(rows)
 
-        kw_weight = self.scoring.keyword_weight
-        results: List[RecallResult] = []
-        for mem, vs, ks in zip(mems, vec_scores, kw_scores):
+        # score raw rows; build Memory objects only for the winners
+        cfg = self.scoring
+        kw_weight = cfg.keyword_weight
+        ln2 = math.log(2)
+        scored = []  # (score, sim, rec, vs, ks, row)
+        for row, vs, ks in zip(rows, vec_scores, kw_scores):
             if mode == "hybrid":
                 sim = (1 - kw_weight) * vs + kw_weight * ks
             elif mode == "vector":
@@ -244,16 +321,24 @@ class MemoryStore:
                 sim = ks
             if sim <= min_similarity:
                 continue  # recency/importance rank relevant memories; they never substitute for relevance
-            score, rec = composite_score(sim, mem, self.scoring, now=now)
+            anchor = row[6] if row[6] is not None else row[5]
+            rec = math.exp(-ln2 * max(0.0, now - anchor) / cfg.half_life_seconds)
+            score = (
+                cfg.weight_similarity * sim
+                + cfg.weight_recency * rec
+                + cfg.weight_importance * row[3]
+                + cfg.weight_usefulness * usefulness_factor(row[8])
+            )
             if score >= min_score:
-                results.append(
-                    RecallResult(
-                        memory=mem, similarity=sim, recency=rec, score=score,
-                        vector_score=vs, keyword_score=ks,
-                    )
-                )
-        results.sort(key=lambda r: r.score, reverse=True)
-        top = results[:k]
+                scored.append((score, sim, rec, vs, ks, row))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        top = [
+            RecallResult(
+                memory=Memory.from_row(row), similarity=sim, recency=rec,
+                score=score, vector_score=vs, keyword_score=ks,
+            )
+            for score, sim, rec, vs, ks, row in scored[:k]
+        ]
         if touch and top:
             with self._lock:
                 self._conn.executemany(
@@ -339,6 +424,7 @@ class MemoryStore:
                 f"SELECT id, namespace FROM memories WHERE {where}", params
             ).fetchall()
             cur = self._conn.execute(f"DELETE FROM memories WHERE {where}", params)
+            self._invalidate()
             for mid, ns in doomed:
                 self._journal("forget", mid, ns, {})
             self._conn.commit()
@@ -377,6 +463,7 @@ class MemoryStore:
                               {"absorbed": absorbed.id, "importance": new_importance,
                                "metadata": merged_meta})
                 self._journal("forget", absorbed.id, namespace, {"reason": "consolidated"})
+            self._invalidate()
             self._conn.commit()
         return len(removed_ids)
 
@@ -424,6 +511,7 @@ class MemoryStore:
         k: int = 50,
         similarity_floor: float = 0.35,
         similarity_ceiling: float = 0.92,
+        min_confidence: str = "possible",
     ) -> List[Conflict]:
         """Surface memories in tension, instead of silently picking a winner.
 
@@ -434,6 +522,8 @@ class MemoryStore:
         Detection is deterministic and free; adjudication is the agent's job —
         resolve() the loser, or ask the user.
         """
+        if min_confidence not in ("possible", "likely"):
+            raise ValueError("min_confidence must be 'possible' or 'likely'")
         if query is not None:
             results = self.recall(query, k=k, namespace=namespace, touch=False)
             mems = [r.memory for r in results]
@@ -442,11 +532,14 @@ class MemoryStore:
         if len(mems) < 2:
             return []
         vecs = self._embeddings_for([m.id for m in mems])
-        return detect_conflicts(
+        found = detect_conflicts(
             mems, vecs,
             similarity_floor=similarity_floor,
             similarity_ceiling=similarity_ceiling,
         )
+        if min_confidence == "likely":
+            found = [c for c in found if c.confidence == "likely"]
+        return found
 
     def resolve(self, keep_id: str, drop_ids: Sequence[str], reason: str = "") -> int:
         """Settle a conflict: keep one memory, forget the others. Fully journaled.
@@ -469,6 +562,7 @@ class MemoryStore:
                                "reason": reason})
                 self._journal("forget", did, mem.namespace, {"reason": f"resolved: {reason}"})
                 dropped += 1
+            self._invalidate()
             self._conn.commit()
         return dropped
 
@@ -516,13 +610,23 @@ class MemoryStore:
         if not results:
             return []
         # near-duplicate suppression, keeping the higher-scored of each pair
-        vecs = self._embeddings_for([r.memory.id for r in results])
         kept: List[int] = []
-        for i in range(len(results)):
-            if all(
-                cosine_similarity(vecs[i], vecs[j]) < dedupe_threshold for j in kept
-            ):
-                kept.append(i)
+        if _np is not None:
+            corpus = self._get_corpus(namespace)
+            idxs = [corpus["idx"][r.memory.id] for r in results]
+            sub = corpus["matrix"][idxs]
+            subn = corpus["norms"][idxs]
+            simmat = (sub @ sub.T) / _np.outer(subn, subn)
+            for i in range(len(results)):
+                if all(simmat[i, j] < dedupe_threshold for j in kept):
+                    kept.append(i)
+        else:
+            vecs = self._embeddings_for([r.memory.id for r in results])
+            for i in range(len(results)):
+                if all(
+                    cosine_similarity(vecs[i], vecs[j]) < dedupe_threshold for j in kept
+                ):
+                    kept.append(i)
         candidates_kept = [results[i] for i in kept]
         tokens = [est(r.memory.content) for r in candidates_kept]
         selected_idx, _total = knapsack_pack(
@@ -576,7 +680,7 @@ class MemoryStore:
                 ).fetchall()
         return [
             JournalEntry(seq=r[0], ts=r[1], op=r[2], memory_id=r[3], namespace=r[4],
-                         payload=json.loads(r[5]) if r[5] else {})
+                         payload=_safe_payload(r[5]))
             for r in rows
         ]
 
@@ -597,7 +701,9 @@ class MemoryStore:
             ).fetchall()
         state: Dict[str, Dict[str, Any]] = {}
         for op, mid, ns, payload_json in rows:
-            payload = json.loads(payload_json) if payload_json else {}
+            payload = _safe_payload(payload_json)
+            if "_corrupt" in payload and op in ("store", "merge"):
+                continue  # cannot reconstruct content from a corrupt entry; skip it
             if op in ("store", "merge"):
                 state[mid] = {
                     "content": payload.get("content", state.get(mid, {}).get("content", "")),
@@ -626,6 +732,9 @@ class MemoryStore:
     def diff(self, a: Union[str, float], b: Union[str, float, None] = None) -> Dict[str, list]:
         """What changed between two points in time?
 
+        Directional: diff(a, b) reads as "what happened going from a to b" —
+        diff(b, a) reports the same changes inverted (added <-> removed).
+
         Args:
             a: Snapshot label or unix timestamp (the "before").
             b: Snapshot label or timestamp (the "after"). Defaults to now.
@@ -636,8 +745,6 @@ class MemoryStore:
         """
         ts_a = self._resolve_ts(a)
         ts_b = self._resolve_ts(b) if b is not None else time.time()
-        if ts_a > ts_b:
-            ts_a, ts_b = ts_b, ts_a
         before = self._state_at(ts_a)
         after = self._state_at(ts_b)
         added = [
@@ -729,6 +836,7 @@ class MemoryStore:
                                        "source": str(getattr(other, "path", "store"))})
                         added += 1
                     self._conn.commit()
+            self._invalidate()
             return {"added": added, "merged": merged}
         finally:
             if close_other:
