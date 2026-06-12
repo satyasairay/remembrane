@@ -35,9 +35,14 @@ def build_server(db_path: str):
         ),
     )
 
+    max_content = int(os.environ.get("REMEMBRANE_MAX_CONTENT", "100000"))
+
     @server.tool()
     def memory_store(content: str, namespace: str = "default", importance: float = 0.5) -> str:
         """Store a memory for later recall. importance: 0.0 (trivial) to 1.0 (critical)."""
+        if len(content) > max_content:
+            return (f"Refused: content is {len(content)} chars; limit is {max_content} "
+                    "(set REMEMBRANE_MAX_CONTENT to change).")
         mem = store.store(content, namespace=namespace, importance=importance)
         return f"Stored memory {mem.id}"
 

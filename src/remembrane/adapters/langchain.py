@@ -64,7 +64,14 @@ def RemembraneChatMessageHistory(store: MemoryStore, session_id: str = "default"
             return out
 
         def add_message(self, message: BaseMessage) -> None:
-            content = message.content if isinstance(message.content, str) else str(message.content)
+            content = message.content
+            if isinstance(content, list):  # structured content blocks: keep the text parts
+                content = " ".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in content
+                ).strip()
+            elif not isinstance(content, str):
+                content = str(content)
             if not content.strip():
                 return
             role = getattr(message, "type", "human")

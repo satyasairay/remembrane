@@ -18,7 +18,7 @@ from .scoring import ScoringConfig, usefulness_factor
 
 try:  # optional acceleration — pip install remembrane[fast]
     import numpy as _np
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover — a broken numpy must never break remembrane
     _np = None
 
 _SCHEMA = """
@@ -100,6 +100,9 @@ class MemoryStore:
         embedder: Any object with ``embed(texts) -> List[List[float]]`` and a
             ``dimension`` attribute. Defaults to the dependency-free HashEmbedder.
         scoring: ScoringConfig controlling ranking weights and decay half-life.
+        journal_mode: SQLite journal mode for file-backed dbs ("WAL" default;
+            pass "DELETE" for the pre-0.5 single-file behavior, e.g. on
+            network filesystems).
     """
 
     def __init__(
@@ -107,6 +110,7 @@ class MemoryStore:
         path: Union[str, Path] = ":memory:",
         embedder: Optional[Embedder] = None,
         scoring: Optional[ScoringConfig] = None,
+        journal_mode: str = "WAL",
     ):
         self.path = str(path)
         if self.path != ":memory:":
@@ -116,23 +120,68 @@ class MemoryStore:
         self.scoring = scoring or ScoringConfig()
         self._lock = threading.RLock()
         self._corpus: Dict[Any, Dict[str, Any]] = {}
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        # isolation_level="IMMEDIATE": write transactions take the write lock up
+        # front, so busy_timeout can wait politely instead of deadlocking on a
+        # deferred-to-write lock upgrade under concurrency.
+        self._conn = sqlite3.connect(
+            self.path, check_same_thread=False, isolation_level="IMMEDIATE"
+        )
+        if self.path != ":memory:":
+            # WAL allows concurrent readers during writes; busy_timeout waits out
+            # short lock contention instead of raising. Note: WAL keeps transient
+            # -wal/-shm sidecar files next to the db, and is unsafe on network
+            # filesystems (NFS/SMB) — see README scope notes.
+            self._conn.execute(f"PRAGMA journal_mode={journal_mode}")
+            self._conn.execute("PRAGMA busy_timeout=30000")
+        self._data_version = self._conn.execute("PRAGMA data_version").fetchone()[0]
         self._conn.executescript(_SCHEMA)
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
         if "usefulness" not in cols:  # migrate dbs created before 0.3.0
             self._conn.execute("ALTER TABLE memories ADD COLUMN usefulness REAL NOT NULL DEFAULT 0")
         self._conn.commit()
 
+    # -------------------------------------------------------------- write retry
+
+    def _retry_locked(self, fn, attempts: int = 6):
+        """Run a write closure, retrying on transient SQLITE_BUSY.
+
+        WAL + busy_timeout handle most contention; this catches the residual
+        snapshot-upgrade races SQLite reports immediately instead of waiting.
+        """
+        for attempt in range(attempts):
+            try:
+                return fn()
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                try:
+                    self._conn.rollback()
+                except sqlite3.OperationalError:
+                    pass
+                time.sleep(0.02 * (2 ** attempt))
+
     # ----------------------------------------------------------- corpus cache
 
     def _invalidate(self) -> None:
         self._corpus.clear()
+
+    def _check_external_changes(self) -> None:
+        """Invalidate caches when ANOTHER connection (thread/process) wrote the db.
+
+        SQLite's data_version pragma changes only when a different connection
+        commits — our own writes are handled by _invalidate() directly.
+        """
+        version = self._conn.execute("PRAGMA data_version").fetchone()[0]
+        if version != self._data_version:
+            self._data_version = version
+            self._corpus.clear()
 
     def _get_corpus(self, namespace: Optional[str]) -> Dict[str, Any]:
         """Cached embeddings + tokenizations per namespace (numpy matrix when available).
 
         Invalidated on every mutation; recall reads stay O(1) SQL + vector math.
         """
+        self._check_external_changes()
         key = namespace
         cached = self._corpus.get(key)
         if cached is not None:
@@ -144,6 +193,22 @@ class MemoryStore:
                 rows = self._conn.execute(
                     "SELECT id, content, embedding FROM memories WHERE namespace=?", (namespace,)
                 ).fetchall()
+        expected_len = 4 * self.embedder.dimension
+        healed = []
+        fixed_rows = []
+        for r in rows:
+            if r[2] is None or len(r[2]) != expected_len:
+                vec = self.embedder.embed([r[1]])[0]  # self-heal: re-embed from content
+                blob = _pack(vec)
+                healed.append((blob, r[0]))
+                fixed_rows.append((r[0], r[1], blob))
+            else:
+                fixed_rows.append(r)
+        if healed:
+            with self._lock:
+                self._conn.executemany("UPDATE memories SET embedding=? WHERE id=?", healed)
+                self._conn.commit()
+        rows = fixed_rows
         ids = [r[0] for r in rows]
         tokens = [tokenize(r[1]) for r in rows]
         corpus: Dict[str, Any] = {"ids": ids, "idx": {mid: i for i, mid in enumerate(ids)},
@@ -154,6 +219,7 @@ class MemoryStore:
         if rows:
             if _np is not None:
                 matrix = _np.vstack([_np.frombuffer(r[2], dtype=_np.float32) for r in rows])
+                matrix = _np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
                 norms = _np.linalg.norm(matrix, axis=1)
                 norms[norms == 0] = 1.0
                 corpus["matrix"] = matrix
@@ -203,24 +269,37 @@ class MemoryStore:
         if memory_id:
             mem.id = memory_id
         vec = self.embedder.embed([content])[0]
-        with self._lock:
-            self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
-            self._invalidate()
-            self._journal(
-                "store",
-                mem.id,
-                namespace,
-                {"content": content, "importance": importance, "metadata": mem.metadata,
-                 "created_at": mem.created_at},
-            )
-            self._conn.commit()
+
+        def _write():
+            with self._lock:
+                self._conn.execute(_INSERT_SQL, (*mem.to_row(), _pack(vec)))
+                self._invalidate()
+                self._journal(
+                    "store",
+                    mem.id,
+                    namespace,
+                    {"content": content, "importance": importance, "metadata": mem.metadata,
+                     "created_at": mem.created_at},
+                )
+                self._conn.commit()
+
+        self._retry_locked(_write)
         return mem
 
     def store_many(self, contents: Sequence[str], **kwargs) -> List[Memory]:
         """Batch store. Embeds all contents in one embedder call."""
         vecs = self.embedder.embed(list(contents))
         out = []
-        with self._lock:
+
+        def _write():
+            out.clear()
+            with self._lock:
+                self._write_many(contents, vecs, kwargs, out)
+
+        self._retry_locked(_write)
+        return out
+
+    def _write_many(self, contents, vecs, kwargs, out):
             for content, vec in zip(contents, vecs):
                 mem = Memory(
                     content=content,
@@ -239,7 +318,6 @@ class MemoryStore:
                 )
                 out.append(mem)
             self._conn.commit()
-        return out
 
     # ------------------------------------------------------------------- read
 
@@ -289,6 +367,13 @@ class MemoryStore:
             return []
 
         corpus = self._get_corpus(namespace)
+        if any(r[0] not in corpus["idx"] for r in rows):
+            # another writer changed the db between the row fetch and cache read
+            self._invalidate()
+            corpus = self._get_corpus(namespace)
+            rows = [r for r in rows if r[0] in corpus["idx"]]
+            if not rows:
+                return []
         order = [corpus["idx"][r[0]] for r in rows]
 
         if mode in ("hybrid", "vector"):
@@ -340,12 +425,14 @@ class MemoryStore:
             for score, sim, rec, vs, ks, row in scored[:k]
         ]
         if touch and top:
-            with self._lock:
-                self._conn.executemany(
-                    "UPDATE memories SET last_accessed_at=?, access_count=access_count+1 WHERE id=?",
-                    [(now, r.memory.id) for r in top],
-                )
-                self._conn.commit()
+            def _touch():
+                with self._lock:
+                    self._conn.executemany(
+                        "UPDATE memories SET last_accessed_at=?, access_count=access_count+1 WHERE id=?",
+                        [(now, r.memory.id) for r in top],
+                    )
+                    self._conn.commit()
+            self._retry_locked(_touch)
         return top
 
     def get(self, memory_id: str) -> Optional[Memory]:
@@ -596,8 +683,10 @@ class MemoryStore:
 
         Scores candidates exactly (like recall), drops near-duplicates so the
         budget isn't spent saying the same thing twice, then solves the packing
-        problem exactly: the returned set maximizes total relevance within
-        ``budget_tokens``. Deterministic, no LLM, microseconds.
+        problem. ``budget_tokens`` is a hard cap in every configuration; the
+        selection is exactly optimal when numpy is installed and near-optimal
+        (coarsened DP + greedy refill) in the pure-python fallback.
+        Deterministic, no LLM.
 
         Args:
             token_estimator: callable(text) -> int. Defaults to a ~4 chars/token

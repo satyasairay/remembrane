@@ -36,6 +36,13 @@ WEAK_MARKERS = frozenset("now new moved changed changing was were used old switc
 
 CHANGE_MARKERS = STRONG_MARKERS | WEAK_MARKERS  # kept for backwards compatibility
 
+# Closed-class value words: two memories naming different members of the same
+# category (with shared anchors) behave like a numeric mismatch.
+_VALUE_CATEGORIES = (
+    frozenset("monday tuesday wednesday thursday friday saturday sunday".split()),
+    frozenset("january february march april may june july august september october november december".split()),
+)
+
 _STOPWORDS = frozenset(
     "the a an is are was were be been to of in on at for and or it its this that "
     "with by from as has have had user prefers prefer likes like".split()
@@ -111,14 +118,23 @@ def detect_conflicts(
                         window = toks[max(0, idx - 3): idx + 4]
                         if anchors.intersection(window):
                             (strong if tok in STRONG_MARKERS else weak).add(tok)
-            numeric_mismatch = bool(numbers[i] and numbers[j] and numbers[i] != numbers[j])
+            has_numbers = bool(numbers[i] and numbers[j] and numbers[i] != numbers[j])
+            value_mismatch = False
+            for cat in _VALUE_CATEGORIES:
+                vi, vj = words[i] & cat, words[j] & cat
+                if vi and vj and vi != vj:
+                    value_mismatch = True
+                    signals.append(f"value_mismatch={sorted(vi)}vs{sorted(vj)}")
+                    break
+            numeric_mismatch = has_numbers or value_mismatch
             # identical content apart from the numbers ("deadline is day 12/26")
             remainder_equal = (words[i] - numbers[i]) == (words[j] - numbers[j])
             if strong:
                 confidence = "likely"
                 signals.append(f"change_markers={sorted(strong)}")
             if numeric_mismatch:
-                signals.append(f"numeric_mismatch={sorted(numbers[i])}vs{sorted(numbers[j])}")
+                if has_numbers:
+                    signals.append(f"numeric_mismatch={sorted(numbers[i])}vs{sorted(numbers[j])}")
                 if remainder_equal or weak:
                     confidence = "likely"
             if weak:
@@ -140,21 +156,36 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4 + 1
 
 
+try:
+    import numpy as _np
+except Exception:  # pragma: no cover
+    _np = None
+
+
 def knapsack_pack(
     scores: Sequence[float],
     tokens: Sequence[int],
     budget: int,
 ) -> Tuple[List[int], int]:
-    """Exact 0/1 knapsack: pick indices maximizing total score within token budget.
+    """0/1 knapsack: pick indices maximizing total score within the token budget.
 
-    Token weights are coarsened to ~1024 buckets so the DP stays fast. Weights
-    are rounded UP, so the budget is never exceeded; the selection is optimal at
-    that granularity (~0.1% of the budget). A final exact check enforces the
-    budget unconditionally. Returns (selected_indices, total_tokens).
+    The budget is a hard guarantee in every path. Optimality depends on the path:
+
+    - numpy available (``remembrane[fast]``): EXACT solution at 1-token
+      granularity via vectorized DP.
+    - pure python: weights are coarsened (rounded UP, never violating the
+      budget) so the DP stays fast, then a greedy refill spends leftover
+      budget — near-optimal, with the README documenting it as such.
+
+    Returns (selected_indices, total_tokens).
     """
     n = len(scores)
     if n == 0 or budget <= 0:
         return [], 0
+
+    if _np is not None and n * budget <= 50_000_000:
+        return _knapsack_exact_np(scores, tokens, budget)
+
     gran = max(1, budget // 1024)
     b = budget // gran
     w = [max(1, -(-t // gran)) for t in tokens]  # ceil division: never under-counts
@@ -184,4 +215,38 @@ def knapsack_pack(
         worst = min(selected, key=lambda i: scores[i])
         selected.remove(worst)
         total -= tokens[worst]
+    # greedy refill: coarsened weights leave headroom; spend it on the best leftovers
+    chosen = set(selected)
+    for i in sorted(range(n), key=lambda i: scores[i], reverse=True):
+        if i not in chosen and scores[i] > 0 and total + tokens[i] <= budget:
+            chosen.add(i)
+            selected.append(i)
+            total += tokens[i]
     return selected, total
+
+
+def _knapsack_exact_np(
+    scores: Sequence[float], tokens: Sequence[int], budget: int
+) -> Tuple[List[int], int]:
+    """Exact 0/1 knapsack at 1-token granularity (vectorized DP + backtrack)."""
+    n = len(scores)
+    dp = _np.zeros(budget + 1, dtype=_np.float64)
+    choice = _np.zeros((n, budget + 1), dtype=bool)
+    for i in range(n):
+        wi, si = int(tokens[i]), float(scores[i])
+        if si <= 0 or wi > budget:
+            continue
+        cand = dp[: budget + 1 - wi] + si
+        seg = dp[wi:]
+        better = cand > seg
+        if better.any():
+            seg[better] = cand[better]
+            choice[i, wi:][better] = True
+    cap = int(dp.argmax())
+    selected: List[int] = []
+    for i in range(n - 1, -1, -1):
+        if choice[i, cap]:
+            selected.append(i)
+            cap -= int(tokens[i])
+    selected.reverse()
+    return selected, sum(int(tokens[i]) for i in selected)

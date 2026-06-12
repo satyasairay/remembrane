@@ -2,7 +2,7 @@
 
 remembrane already scans every memory at recall time for exact vector
 similarity, so BM25 comes nearly free: one extra pass over the same rows.
-At agent-memory scale (thousands of rows) this stays sub-millisecond.
+At agent-memory scale (thousands of rows) this stays fast; run python -m remembrane.bench for numbers on your machine.
 """
 from __future__ import annotations
 

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.5.0 — 2026-06-12
+
+Response to round 3 of independent auditing ("mother of all audits").
+
+### Fixed
+- **Cross-connection cache coherence (audit: High, production blocker).**
+  Caches now detect writes from other connections/processes via SQLite's
+  data_version and rebuild safely; recall retries on mid-read external writes.
+  The audit's 8-process hammer (779 KeyErrors in 60s on 0.4.0) now runs clean.
+- **Concurrency hardening.** File-backed stores default to WAL journal mode
+  with busy_timeout=30s and immediate write transactions; residual lock races
+  retried with backoff. `journal_mode="DELETE"` restores strict
+  single-file behavior.
+- **pack() optimality (audit: Medium).** Exact 1-token-granularity knapsack
+  when numpy is present (audit's 1000-trial probe: worst loss 23.29% -> 0.00%);
+  pure-python fallback gains greedy refill (23.29% -> 16.47% worst observed)
+  and is documented as near-optimal.
+- **Broken numpy no longer breaks import (audit: Medium).** Soft import
+  catches all exceptions.
+- **Corrupt embedding blobs self-heal (audit: Medium).** Wrong-length blobs
+  are re-embedded from content and persisted; NaN/Inf vectors are scrubbed in
+  the numpy path.
+- **Conflict detection (audit: Medium).** Weekday/month value mismatches now
+  count like numeric mismatches, fixing the audit's false negative
+  ("deadline is Friday" -> "deadline is now Monday").
+- **README/MCP mismatch (audit: Medium).** Tool list corrected to all nine
+  tools; MCP memory_store now rejects content over REMEMBRANE_MAX_CONTENT
+  (default 100k chars).
+- **Validation gaps (audit: Low).** namespace must be a non-empty string
+  (was: raw IntegrityError on None); metadata must be JSON-serializable
+  without NaN/Infinity (was: NaN accepted, datetime raised raw TypeError).
+- **LangChain structured content (audit: Low).** List-of-parts message
+  content stores its text, not str(list).
+- Reopening an empty db file (e.g. after a kill during creation) repairs the
+  schema.
+
+### Added
+- `python -m remembrane.bench` — measure recall/pack on your own machine; the
+  README now publishes two reference tables (ours + the independent audit's)
+  instead of implying portability.
+
+### Changed
+- CrewAI adapter documents honestly that it is not a StorageBackend subclass
+  (native integration on the roadmap); adds get_record/count.
+- README: concurrency section, WAL sidecar/NFS caveats, journal/export scope
+  notes, CrewAI telemetry note.
+
 ## 0.4.0 — 2026-06-12
 
 Driven by round 2 of independent auditing (adversarial claim verification).

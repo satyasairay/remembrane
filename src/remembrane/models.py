@@ -40,8 +40,18 @@ class Memory:
             raise ValueError("Memory content must be a non-empty string")
         if not 0.0 <= self.importance <= 1.0:
             raise ValueError("importance must be between 0.0 and 1.0")
+        if not isinstance(self.namespace, str) or not self.namespace:
+            raise ValueError("namespace must be a non-empty string")
         if self.metadata is not None and not isinstance(self.metadata, dict):
             raise ValueError("metadata must be a dict (or None)")
+        if self.metadata:
+            try:
+                json.dumps(self.metadata, allow_nan=False)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "metadata must be JSON-serializable without NaN/Infinity "
+                    f"({exc})"
+                ) from exc
 
     def to_row(self) -> tuple:
         return (

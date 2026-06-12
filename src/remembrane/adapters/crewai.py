@@ -1,13 +1,16 @@
 """CrewAI-compatible storage adapter.
 
-Implements the surface of CrewAI's external-storage protocol as of crewai
-1.x — save / search / delete / update / list_records / reset — duck-typed, so
-crewai itself is never imported. All methods tolerate extra keyword arguments
-(CrewAI passes scope/filter kwargs that vary by version; unknown kwargs are
-accepted and ignored rather than crashing the pipeline).
+A remembrane-backed storage helper for CrewAI-style pipelines: save / search /
+delete / update / list_records / get_record / count / reset, duck-typed, with
+kwargs tolerance (scope_prefix etc.). crewai itself is never imported.
 
-If a CrewAI release adds methods this adapter lacks, please open an issue:
+HONEST LIMITATION: this is NOT a registered subclass of crewai's
+``StorageBackend`` ABC, and ``search()`` returns dicts rather than
+``(MemoryRecord, score)`` tuples — so wiring it directly into
+``crewai.Memory(...)`` does not work as of crewai 1.14. Native StorageBackend
+integration is tracked at:
 https://github.com/satyasairay/remembrane/issues
+Use it directly, or behind your own thin StorageBackend shim.
 """
 from __future__ import annotations
 
@@ -81,6 +84,15 @@ class RemembraneStorage:
             {"id": m.id, "content": m.content, "metadata": m.metadata}
             for m in self.store.all(self.namespace)[: int(limit)]
         ]
+
+    def get_record(self, record_id: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        m = self.store.get(record_id)
+        if m is None:
+            return None
+        return {"id": m.id, "content": m.content, "metadata": m.metadata}
+
+    def count(self, **kwargs: Any) -> int:
+        return self.store.count(self.namespace)
 
     def reset(self) -> None:
         self.store.forget(namespace=self.namespace)

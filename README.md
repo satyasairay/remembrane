@@ -1,6 +1,6 @@
 # remembrane
 
-**Local-first persistent memory for AI agents.** One SQLite file, zero required dependencies. Exact hybrid recall (vector + BM25 — never approximate), explainable ranking, time-travel over memory history, conflict-aware recall that admits uncertainty, salience learned from task outcomes, optimal token-budget packing, and deterministic behavior you can unit-test in CI. Adapters for LangChain and CrewAI, plus a built-in MCP server.
+**Local-first persistent memory for AI agents.** One SQLite file, zero required dependencies. Exact hybrid recall (vector + BM25 — never approximate), explainable ranking, time-travel over memory history, conflict-aware recall that admits uncertainty, salience learned from task outcomes, budget-capped context packing (exactly optimal when numpy is present), and deterministic behavior you can unit-test in CI. Adapters for LangChain and CrewAI, plus a built-in MCP server.
 
 ```bash
 pip install remembrane
@@ -105,7 +105,7 @@ storage.save("the deadline is next friday", metadata={"task": "planning"})
 storage.search("when is the deadline?")          # also: delete / update / list_records / reset
 ```
 
-Duck-typed against CrewAI's storage protocol (save/search/delete/update/list_records/reset, tolerant of version-specific kwargs like `scope_prefix`). CrewAI's interface moves fast — if a release adds methods we lack, open an issue.
+A storage helper, duck-typed (save/search/delete/update/list_records/get_record/count/reset, kwargs-tolerant). **Known limitation:** it is not a registered `crewai.StorageBackend` subclass and returns dicts rather than `(MemoryRecord, score)` tuples, so plugging it directly into `crewai.Memory(...)` does not work as of crewai 1.14 — use it directly or behind a thin shim. Native StorageBackend integration is on the roadmap. Note CrewAI itself phones home (`telemetry.crewai.com`); set `CREWAI_DISABLE_TELEMETRY=true` if that matters to you — bare remembrane opens no sockets (verified by audit under Python audit hooks).
 
 ## MCP server
 
@@ -127,7 +127,7 @@ remembrane-mcp --db ~/agent-memory.db
 }
 ```
 
-Tools exposed: `memory_store`, `memory_recall`, `memory_forget`, `memory_reinforce`, `memory_stats`.
+Tools exposed: `memory_store`, `memory_recall`, `memory_forget`, `memory_reinforce`, `memory_conflicts`, `memory_resolve`, `memory_feedback`, `memory_pack`, `memory_stats`. Stored content is capped at 100k chars per memory (`REMEMBRANE_MAX_CONTENT` to change).
 
 ## CLI
 
@@ -158,7 +158,7 @@ for c in mem.conflicts("where does the user live?"):
 mem.resolve(keep_id=newer.id, drop_ids=[older.id], reason="user confirmed Tokyo")
 ```
 
-Detection is deterministic and free (anchor-word overlap, negation markers, numeric mismatches — honest heuristics, not hidden LLM judgments). Two confidence tiers: `likely` (strong negation or corroborated numeric change) and `possible` (topical tension worth a look). On our 8-case adversarial set the `likely` tier scores perfect precision and recall — but it is 8 hand-built cases, so treat conflicts as *candidates for the agent to adjudicate*, which is the design intent. Filter with `conflicts(min_confidence='likely')`. Resolutions are journaled, so every settled conflict stays auditable via `log()` and `as_of()`. Also exposed as the `memory_conflicts` / `memory_resolve` MCP tools and `remembrane conflicts` CLI.
+Detection is deterministic and free (anchor-word overlap, negation markers, numeric mismatches — honest heuristics, not hidden LLM judgments). Two confidence tiers: `likely` (strong negation, or a numeric/weekday/month mismatch with corroboration) and `possible` (topical tension worth a look). Independent audit on a 30-pair adversarial set measured the `likely` tier at 0.875 precision / 0.70 recall on v0.4; v0.5 fixes that audit's reported false negatives (e.g. weekday changes). It remains a heuristic: treat conflicts as *candidates for the agent to adjudicate*, which is the design intent. Filter with `conflicts(min_confidence='likely')`. Resolutions are journaled, so every settled conflict stays auditable via `log()` and `as_of()`. Also exposed as the `memory_conflicts` / `memory_resolve` MCP tools and `remembrane conflicts` CLI.
 
 ## Salience earned from outcomes
 
@@ -182,7 +182,7 @@ context = mem.pack("user preferences", budget_tokens=800)
 sum(r.tokens for r in context)   # <= 800, guaranteed
 ```
 
-`pack()` scores every candidate exactly, suppresses near-duplicates so the budget is never spent saying the same thing twice, then solves the selection with a 0/1 knapsack. The budget is a hard guarantee — token weights round *up* at ~0.1%-of-budget granularity and a final exact check enforces the cap, so the result can be marginally conservative but never over. Deterministic, no LLM. Pass `token_estimator=your_tokenizer` for exact counts.
+`pack()` scores every candidate exactly, suppresses near-duplicates so the budget is never spent saying the same thing twice, then solves the selection with a 0/1 knapsack. The budget is a hard guarantee in every configuration (verified over thousands of randomized trials). Optimality depends on the path: with numpy installed the solution is *exact* at 1-token granularity; the pure-python fallback uses coarsened weights plus a greedy refill and is documented as near-optimal, not optimal (worst observed loss 16% on adversarial random instances — real memory stores sit nowhere near that). Deterministic, no LLM. Pass `token_estimator=your_tokenizer` for exact counts.
 
 ## Time travel
 
@@ -245,15 +245,25 @@ CLI: `remembrane --db a.db merge b.db`
 
 ## Performance
 
-Measured on this repo's benchmark (512-dim default embedder, hybrid recall, warm cache; Linux sandbox, Python 3.10). Exact numbers vary by machine — run your own before relying on them:
+Performance numbers don't travel between machines, so measure your own first:
 
-| memories | recall (numpy) | pack (numpy) | recall (pure python) |
+```bash
+python -m remembrane.bench
+```
+
+Two reference points (hybrid recall, 512-dim default embedder, warm cache):
+
+| memories | recall / pack (Linux sandbox, py3.10, numpy) | recall / pack (independent audit: Windows, py3.12, numpy) | recall (pure python, audit machine) |
 |---|---|---|---|
-| 1,000 | ~2 ms | ~17 ms | ~50 ms |
-| 10,000 | ~30 ms | ~44 ms | ~475 ms |
-| 50,000 | ~205 ms | ~222 ms | not recommended |
+| 1,000 | ~2 ms / ~17 ms | ~5 ms / ~32 ms | ~113 ms |
+| 10,000 | ~30 ms / ~44 ms | ~51 ms / ~76 ms | ~1.2 s |
+| 50,000 | ~205 ms / ~222 ms | ~1.0 s / ~430 ms | ~6.8 s |
 
-The core stays dependency-free; if numpy is importable it is used automatically (`pip install remembrane[fast]`). Past ~50k memories in one namespace you've outgrown the design — that's vector-database territory, and remembrane won't pretend otherwise.
+The core stays dependency-free; if numpy is importable it is used automatically (`pip install remembrane[fast]`), and a broken numpy install is ignored rather than fatal. For sub-10ms recall beyond ~10k memories, or anything beyond ~50k, you've outgrown the design — that's vector-database territory, and remembrane won't pretend otherwise.
+
+### Concurrency
+
+Multiple connections, threads, and processes can share one memory file: file-backed stores default to SQLite WAL mode with a busy timeout and immediate write transactions, caches detect external writes via SQLite's `data_version`, and residual lock races are retried. Our test suite hammers 3 connections × 6 threads and 8 processes against a single file with zero errors. Two caveats: WAL keeps transient `-wal`/`-shm` sidecar files next to the db (pass `journal_mode="DELETE"` for strict single-file behavior), and SQLite on network filesystems (NFS/SMB) is unsafe regardless of mode — keep memory files on local disk.
 
 ## How ranking works
 
@@ -269,7 +279,7 @@ Scoring is a weighted sum (weights normalize to 1), with one hard rule on top: s
 
 ## Design choices
 
-- **SQLite over a vector DB** — agent memory stores are small (thousands, not billions, of rows). Brute-force cosine over a few thousand vectors is sub-millisecond, and you gain transactions, a single portable file, and zero infra.
+- **SQLite over a vector DB** — agent memory stores are small (thousands, not billions, of rows). Exact brute-force scoring at that scale is fast enough (see Performance for measured numbers), and you gain transactions, a single portable file, and zero infra.
 - **No background daemon** — decay is computed at read time, so nothing runs when your agent doesn't.
 - **Duck-typed adapters** — `remembrane` never imports langchain or crewai; the adapters match their interfaces structurally, so there are no version-pinning fights.
 
@@ -278,6 +288,10 @@ Scoring is a weighted sum (weights normalize to 1), with one hard rule on top: s
 - The CLI writes wherever `--db` points, with the invoking user's permissions — it is a local tool, not a sandbox. Wrap it if you expose it to untrusted input.
 - OS argv limits apply to `remembrane store "<content>"`; use `--file path` or `--file -` (stdin) for large content.
 - MCP argument validation follows pydantic's lax coercion (e.g. `useful="yes"` coerces to `True`).
+- Recall `touch` updates (access stats) are statistics, not events — they are intentionally not journaled, and `as_of()` reconstructs content/importance state only.
+- `export()`/`merge_from()` carry memories (content, importance, metadata, access stats, usefulness) but not the source's journal history; embeddings are regenerated by the destination's embedder.
+- Journal entries with corrupt payloads are surfaced in `log()` (with a `_corrupt` key) and skipped by `as_of()` reconstruction.
+- A process killed during initial db creation can leave an empty file; reopening it repairs the schema automatically.
 
 ## Development
 
