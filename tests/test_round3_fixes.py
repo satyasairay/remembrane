@@ -66,18 +66,30 @@ def test_corrupt_embedding_blob_self_heals(tmp_path):
     m.close()
 
 
-def test_broken_numpy_does_not_break_import(tmp_path, monkeypatch):
+def test_broken_numpy_does_not_break_import(tmp_path):
     """Round 3 Medium: a present-but-broken numpy must not crash imports."""
+    import os
     import subprocess
     import sys
     bad = tmp_path / "numpy.py"
     bad.write_text("raise RuntimeError('broken numpy install')\n")
     import remembrane
     pkg_root = str(__import__("pathlib").Path(remembrane.__file__).parent.parent)
+    env = dict(os.environ)  # keep SystemRoot etc. — stripping env breaks Windows Python
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), pkg_root])
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    import numpy\n"
+        "    sys.exit('fake numpy was not picked up')\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "import remembrane\n"
+        "print(remembrane.__version__)\n"
+    )
     proc = subprocess.run(
-        [sys.executable, "-c", "import remembrane; print(remembrane.__version__)"],
-        capture_output=True, text=True,
-        env={"PYTHONPATH": f"{tmp_path}:{pkg_root}", "PATH": "/usr/bin:/bin"},
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, env=env,
     )
     assert proc.returncode == 0, proc.stderr
 
